@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  message-gateway:
+    container_name: message_gateway
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: always
+    ports:
+      - "3005:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      # Usa il Redis dedicato del gateway (con AOF) invece di evolution_redis
+      - REDIS_URL=redis://gateway_redis:6379
+      - RABBITMQ_URL=amqp://admin:admin123@evolution_rabbitmq:5672
+      - EVOLUTION_API_URL=http://evolution_api:8080
+      - OPENBAO_AGENT_MODE=true
+      - OPENBAO_ADDR=http://host-gateway:8200
+      - MAIN_APP_WEBHOOK_URL=${MAIN_APP_WEBHOOK_URL}
+      # Default sviluppo (no main-app): http://localhost:3000/whatsapp/test/webhook-sink
+      # Produzione: http://host-gateway:3000/api/webhooks/whatsapp
+      - BULLBOARD_USER=${BULLBOARD_USER:-admin}
+      - BULLBOARD_PASSWORD=${BULLBOARD_PASSWORD}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+    extra_hosts:
+      - "host-gateway:172.19.0.1"
+    networks:
+      - evolution-net
+    depends_on:
+      gateway_redis:
+        condition: service_healthy
+
+  # Redis dedicato al gateway con persistenza AOF abilitata.
+  # Garantisce che i job BullMQ (reminder, recap, callback-webhook) sopravvivano
+  # a crash o blackout. I dati vengono scritti su disco ogni secondo (appendfsync everysec).
+  gateway_redis:
+    image: redis:7-alpine
+    container_name: gateway_redis
+    restart: always
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+    volumes:
+      - gateway_redis_data:/data
+    networks:
+      - evolution-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  gateway_redis_data:
+    driver: local
+
+# Rete esterna già esistente (dove girano Evolution, RabbitMQ, OpenBao)
+networks:
+  evolution-net:
+    external: true
