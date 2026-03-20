@@ -1,0 +1,7 @@
+export enum TaskMessageStatus {
+  SCHEDULED = 'SCHEDULED',
+  AVAILABLE = 'AVAILABLE',
+  READ = 'READ',
+  COMPLETED = 'COMPLETED',
+  DELETED = 'DELETED',
+}

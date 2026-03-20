@@ -9,6 +9,7 @@ import { AuthModule } from './auth/auth.module';
 import { AuditModule } from './audit/audit.module';
 import { CommonModule } from './common/common.module';
 import { WebhookModule } from './webhook/webhook.module';
+import { TaskMessageModule } from './task-message/task-message.module';
 
 @Module({
   imports: [
@@ -58,6 +59,7 @@ import { WebhookModule } from './webhook/webhook.module';
     WhatsappModule,
     AuditModule,
     WebhookModule,
+    TaskMessageModule,
   ],
 })
 export class AppModule {}

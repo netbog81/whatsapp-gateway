@@ -43,10 +43,11 @@ async function bootstrap() {
   const config = new DocumentBuilder()
     .setTitle('WhatsApp Gateway Multi-tenant')
     .setDescription(
-      'Microservizio per la gestione di messaggi WhatsApp, Reminder e Task interni via Evolution API.',
+      'Microservizio per la gestione di messaggi WhatsApp, Reminder, Task interni via Evolution API e Messaggistica/Task tra utenti.',
     )
     .setVersion('1.0')
     .addTag('WhatsApp Dispatcher')
+    .addTag('Task Messages')
     .addGlobalParameters({
       in: 'header',
       required: true,
