@@ -13,7 +13,12 @@ export class BaoService implements OnModuleInit {
     const endpoint = this.configService.get<string>('OPENBAO_ADDR', 'http://host-gateway:8200');
     const agentMode = this.configService.get<string>('OPENBAO_AGENT_MODE') === 'true';
 
-    this.openbao = new OpenbaoBaseService({ endpoint, agentMode });
+    this.openbao = new OpenbaoBaseService({
+      endpoint,
+      agentMode,
+      enableProxyHealthCheck: true,
+      proxyHealthCheckIntervalMs: 60 * 1000,
+    });
     this.logger.log(`OpenBao client inizializzato: ${endpoint} (agent mode: ${agentMode})`);
   }
 
