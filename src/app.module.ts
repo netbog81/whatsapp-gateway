@@ -10,6 +10,7 @@ import { AuditModule } from './audit/audit.module';
 import { CommonModule } from './common/common.module';
 import { WebhookModule } from './webhook/webhook.module';
 import { TaskMessageModule } from './task-message/task-message.module';
+import { HealthModule } from './health/health.module';
 
 @Module({
   imports: [
@@ -60,6 +61,7 @@ import { TaskMessageModule } from './task-message/task-message.module';
     AuditModule,
     WebhookModule,
     TaskMessageModule,
+    HealthModule,
   ],
 })
 export class AppModule {}
