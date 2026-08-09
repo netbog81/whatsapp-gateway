@@ -15,6 +15,12 @@ import { OtpChannel, SendOtpDto, SendOtpResult } from './dto/send-otp.dto';
 /** Intervallo minimo tra messaggi WhatsApp OTP dello stesso tenant (più corto dei recap: il paziente sta aspettando). */
 const OTP_WA_MIN_INTERVAL_MS = 2000;
 
+/** Chiavi Redis condivise con il consumer dei webhook. */
+export const OTP_TRACK_PREFIX = 'otp_track:';
+export const OTP_STATUS_PREFIX = 'otp_status:';
+/** Un'ora: molto oltre la finestra di validità di qualunque OTP. */
+export const OTP_TRACK_TTL_S = 3600;
+
 /**
  * Consegna OTP con fallback di canale. Il gateway è "dumb pipe": il codice
  * è generato e verificato SOLO dal chiamante (modulo signature del
@@ -47,8 +53,21 @@ export class OtpDeliveryService {
 
     // Canali privi del recapito necessario: saltati senza contare come
     // errore. Con più canali eterogenei è la norma, non un'anomalia.
-    const usable = channels.filter((channel) => this.hasRecipient(channel, dto));
-    const skipped = channels.filter((channel) => !usable.includes(channel));
+    const usable: OtpChannel[] = [];
+    const skipped: string[] = [];
+    for (const channel of channels) {
+      if (!this.hasRecipient(channel, dto)) {
+        skipped.push(channel);
+        continue;
+      }
+      // Un numero senza WhatsApp non produce errore da Evolution: senza
+      // questo controllo il cliente resterebbe senza codice.
+      if (channel === 'whatsapp' && (await this.isOnWhatsapp(tenantId, dto.phone!)) === false) {
+        skipped.push('whatsapp (numero non su WhatsApp)');
+        continue;
+      }
+      usable.push(channel);
+    }
     if (skipped.length) {
       this.logger.log(
         `Canali saltati per mancanza di recapito (tenant ${tenantId}): ${skipped.join(', ')}`,
@@ -152,6 +171,54 @@ export class OtpDeliveryService {
     return channel === 'email' ? !!dto.email : !!dto.phone;
   }
 
+  /**
+   * Il numero è registrato su WhatsApp?
+   *
+   *   true  → registrato
+   *   false → NON registrato: il canale va saltato, altrimenti Evolution
+   *           accetta il messaggio e il cliente resta senza codice
+   *   null  → non determinabile (endpoint assente, errore, risposta
+   *           inattesa): si prosegue e si tenta l'invio come prima
+   *
+   * Il fail-open è deliberato: una diversa versione di Evolution deve
+   * degradare al comportamento precedente, non impedire la consegna.
+   * Esito in cache 24h — lo stato WhatsApp di un numero cambia di rado.
+   */
+  private async isOnWhatsapp(tenantId: string, phone: string): Promise<boolean | null> {
+    const digits = phone.replace(/\D/g, '');
+    const cacheKey = `wa_registered:${tenantId}:${digits}`;
+    const cached = await this.redis.get(cacheKey).catch(() => null);
+    if (cached === '1') return true;
+    if (cached === '0') return false;
+
+    try {
+      const token = await this.getEvolutionToken(tenantId);
+      if (!token) return null;
+      const evolutionUrl = this.configService.get<string>('EVOLUTION_API_URL');
+      const response = await firstValueFrom(
+        this.httpService.post(
+          `${evolutionUrl}/chat/whatsappNumbers/${tenantId}`,
+          { numbers: [digits] },
+          { headers: { apikey: token }, timeout: 8000 },
+        ),
+      );
+      const entry = Array.isArray(response.data) ? response.data[0] : null;
+      if (!entry || typeof entry.exists !== 'boolean') {
+        this.logger.warn(
+          `Verifica numero WhatsApp: risposta inattesa da Evolution per ${tenantId}, procedo comunque`,
+        );
+        return null;
+      }
+      await this.redis.set(cacheKey, entry.exists ? '1' : '0', 'EX', 86400).catch(() => undefined);
+      return entry.exists;
+    } catch (error: any) {
+      this.logger.warn(
+        `Verifica numero WhatsApp non riuscita per ${tenantId} (${error.message}): procedo comunque`,
+      );
+      return null;
+    }
+  }
+
   private maskFor(channel: OtpChannel, dto: SendOtpDto): string {
     return channel === 'email' ? maskEmail(dto.email ?? '') : maskPhone(dto.phone ?? '');
   }
@@ -228,7 +295,35 @@ export class OtpDeliveryService {
         { headers: { apikey: token }, timeout: 15000 },
       ),
     );
-    return { driver: 'evolution', providerMessageId: response.data?.key?.id };
+    const providerMessageId = response.data?.key?.id;
+    if (providerMessageId) {
+      // Segna il messaggio come OTP: il consumer dei webhook registrerà
+      // l'esito di consegna solo per questi, senza sporcare gli altri.
+      await this.redis
+        .set(`${OTP_TRACK_PREFIX}${tenantId}:${providerMessageId}`, '1', 'EX', OTP_TRACK_TTL_S)
+        .catch(() => undefined);
+    }
+    return { driver: 'evolution', providerMessageId };
+  }
+
+  /**
+   * Esito di consegna di un OTP WhatsApp, se il webhook l'ha registrato.
+   * Non blocca nessuno: l'operatore lo consulta quando vuole sapere se il
+   * codice è arrivato, e il codice scade per conto suo.
+   */
+  async deliveryStatus(
+    tenantId: string,
+    providerMessageId: string,
+  ): Promise<{ status: string; at: string } | null> {
+    const raw = await this.redis
+      .get(`${OTP_STATUS_PREFIX}${tenantId}:${providerMessageId}`)
+      .catch(() => null);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
   }
 
   /** Stessa cache token del WhatsappProcessor (chiave condivisa). */

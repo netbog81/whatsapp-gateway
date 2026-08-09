@@ -1,4 +1,4 @@
-import { Body, Controller, Headers, HttpCode, HttpStatus, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Headers, HttpCode, HttpStatus, Param, Post, Req, UseGuards } from '@nestjs/common';
 import { ApiHeader, ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Request } from 'express';
 import { TenantAuthGuard } from '../auth/tenant-auth.guard';
@@ -31,6 +31,20 @@ export class OtpController {
   ): Promise<SendOtpResult> {
     const ipAddress = req.ip || req.headers['x-forwarded-for']?.toString() || 'unknown';
     return this.otpDeliveryService.send(tenantId, dto, ipAddress);
+  }
+
+  @Get('delivery/:messageId')
+  @ApiOperation({
+    summary: 'Esito di consegna di un OTP WhatsApp',
+    description:
+      'null se non risulta ancora consegnato (o se il canale non sa dirlo, come SMS ed email). ' +
+      'Non blocca nulla: il codice scade per conto suo.',
+  })
+  async delivery(
+    @Param('messageId') messageId: string,
+    @Headers('x-tenant-id') tenantId: string,
+  ): Promise<{ status: string; at: string } | null> {
+    return this.otpDeliveryService.deliveryStatus(tenantId, messageId);
   }
 
   @Post('email/test')

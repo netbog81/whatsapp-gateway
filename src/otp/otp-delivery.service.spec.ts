@@ -121,6 +121,62 @@ describe('OtpDeliveryService', () => {
     expect(result.usedFallback).toBe(false);
   });
 
+  it('numero senza WhatsApp: il canale viene saltato e si passa a SMS', async () => {
+    // Evolution accetterebbe il messaggio senza errore: senza il controllo
+    // preventivo il cliente resterebbe senza codice.
+    baoService.getSecret.mockImplementation(async (path: string) =>
+      path.includes('evolution_apikey') ? { api_key: 'evo-key' } : null,
+    );
+    httpService.post.mockReturnValue(of({ data: [{ exists: false, number: '393471234567' }] }));
+    personalGsmDriver.send.mockResolvedValue({ providerMessageId: 'gsm-2' });
+
+    const result = await service.send(
+      'bdq',
+      dto({ channelPriority: ['whatsapp', 'sms'], smsDriver: 'personal_gsm' }),
+      '10.0.0.1',
+    );
+
+    expect(result.channel).toBe('sms');
+    // saltato per assenza da WhatsApp, non per un errore di consegna
+    expect(result.usedFallback).toBe(false);
+  });
+
+  it('verifica numero non disponibile: si tenta WhatsApp lo stesso (fail-open)', async () => {
+    // Una versione di Evolution senza quell'endpoint non deve impedire l'invio.
+    baoService.getSecret.mockImplementation(async (path: string) =>
+      path.includes('evolution_apikey') ? { api_key: 'evo-key' } : null,
+    );
+    let call = 0;
+    httpService.post.mockImplementation(() => {
+      call += 1;
+      if (call === 1) throw new Error('404 not found');
+      return of({ data: { key: { id: 'wa-msg-9' } } });
+    });
+
+    const result = await service.send(
+      'bdq', dto({ channelPriority: ['whatsapp'] }), '10.0.0.1',
+    );
+
+    expect(result.channel).toBe('whatsapp');
+    expect(result.providerMessageId).toBe('wa-msg-9');
+  });
+
+  it('numero registrato: WhatsApp procede', async () => {
+    baoService.getSecret.mockImplementation(async (path: string) =>
+      path.includes('evolution_apikey') ? { api_key: 'evo-key' } : null,
+    );
+    let call = 0;
+    httpService.post.mockImplementation(() => {
+      call += 1;
+      return call === 1
+        ? of({ data: [{ exists: true, number: '393471234567' }] })
+        : of({ data: { key: { id: 'wa-msg-10' } } });
+    });
+
+    const result = await service.send('bdq', dto({ channelPriority: ['whatsapp'] }), '10.0.0.1');
+    expect(result.channel).toBe('whatsapp');
+  });
+
   it('canale email: consegna via SMTP con oggetto', async () => {
     smtpDriver.send.mockResolvedValue({ providerMessageId: 'smtp-1', from: 'noreply@curandis.cloud' });
 

@@ -6,6 +6,7 @@ import { InjectRedis } from '@nestjs-modules/ioredis';
 import Redis from 'ioredis';
 import * as amqp from 'amqplib';
 import { v4 as uuidv4 } from 'uuid';
+import { OTP_STATUS_PREFIX, OTP_TRACK_PREFIX, OTP_TRACK_TTL_S } from '../otp/otp-delivery.service';
 
 const EVOLUTION_EXCHANGE = 'evolution_events';
 const QUEUE_NAME = 'whatsapp-gateway.evolution-events';
@@ -137,6 +138,26 @@ export class WebhookConsumer implements OnModuleInit, OnModuleDestroy {
       if (!evolutionMsgId) {
         this.logger.debug(`[RABBITMQ] no msgId: event=${event.event} data_keys=${Object.keys(event.data || {}).join(',')}`);
       }
+      // Esito di consegna degli OTP: registrato solo per i messaggi che
+      // l'OtpDeliveryService ha marcato, così non si tocca il resto del
+      // traffico. Serve a distinguere "non arrivato" da "arrivato e non
+      // digitato", che allo sportello sono due situazioni diverse.
+      if (tenantId && evolutionMsgId && ['DELIVERY_ACK', 'READ', 'PLAYED'].includes(String(updateStatus))) {
+        const tracked = await this.redis.get(`${OTP_TRACK_PREFIX}${tenantId}:${evolutionMsgId}`);
+        if (tracked) {
+          await this.redis.set(
+            `${OTP_STATUS_PREFIX}${tenantId}:${evolutionMsgId}`,
+            JSON.stringify({
+              status: updateStatus === 'DELIVERY_ACK' ? 'delivered' : 'read',
+              at: new Date().toISOString(),
+            }),
+            'EX',
+            OTP_TRACK_TTL_S,
+          );
+          this.logger.log(`[OTP] consegna confermata per ${evolutionMsgId} (${updateStatus})`);
+        }
+      }
+
       let msgMetadata: any = null;
       if (tenantId && evolutionMsgId) {
         const metaJson = await this.redis.get(`msg_meta:${tenantId}:${evolutionMsgId}`);
