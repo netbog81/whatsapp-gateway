@@ -45,10 +45,25 @@ export class SmtpDriver {
     return { providerMessageId: info.messageId, from: config.from };
   }
 
-  /** Verifica la raggiungibilità dell'SMTP senza inviare nulla. */
+  /**
+   * Verifica la raggiungibilità dell'SMTP senza inviare nulla.
+   *
+   * La risoluzione della configurazione è separata dal tentativo di
+   * connessione: se fallisce la connessione dobbiamo comunque dire QUALE
+   * SMTP è stato tentato, altrimenti chi sta configurando il proprio
+   * server legge "relay condiviso" e cerca il problema dalla parte sbagliata.
+   */
   async verify(tenantId: string): Promise<{ ok: boolean; detail: string; source: SmtpConfig['source'] }> {
+    let resolved: { config: SmtpConfig; transport: Transporter };
     try {
-      const { config, transport } = await this.resolve(tenantId);
+      resolved = await this.resolve(tenantId);
+    } catch (error) {
+      // Nessuna configurazione risolta: non c'è un `source` da riportare.
+      return { ok: false, detail: (error as Error).message, source: 'saas' };
+    }
+
+    const { config, transport } = resolved;
+    try {
       await transport.verify();
       return {
         ok: true,
@@ -56,8 +71,11 @@ export class SmtpDriver {
         source: config.source,
       };
     } catch (error) {
-      const message = (error as Error).message;
-      return { ok: false, detail: `SMTP non raggiungibile: ${message}`, source: 'saas' };
+      return {
+        ok: false,
+        detail: `SMTP ${config.host}:${config.port} non raggiungibile: ${(error as Error).message}`,
+        source: config.source,
+      };
     }
   }
 
