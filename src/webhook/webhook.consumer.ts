@@ -176,6 +176,25 @@ export class WebhookConsumer implements OnModuleInit, OnModuleDestroy {
         }
       }
 
+      // Messaggi di chat senza msg_meta in Redis: non li ha mandati il gateway.
+      //  - fromMe = false → messaggio in ARRIVO dal paziente
+      //  - fromMe = true  → messaggio scritto DAL TELEFONO dello studio, fuori
+      //    dall'applicativo. Va inoltrato lo stesso: senza, la conversazione
+      //    mostrata in segreteria avrebbe dei buchi.
+      // I messaggi inviati dal gateway hanno sempre msg_meta (scritto subito
+      // dopo l'invio, TTL 48h), quindi non finiscono mai qui.
+      if (!msgMetadata && event.event === 'messages.upsert') {
+        const fromMe = event.data?.key?.fromMe;
+        if (fromMe === false || fromMe === true) {
+          msgMetadata = {
+            message_type: fromMe ? 'chat_outbound_external' : 'chat_inbound',
+            correlation_id: event.correlationId || uuidv4(),
+            patient_id: null,
+            appointment_ids: [],
+          };
+        }
+      }
+
       await this.callbackQueue.add(
         'send-callback',
         {

@@ -11,6 +11,8 @@ import { CommonModule } from './common/common.module';
 import { WebhookModule } from './webhook/webhook.module';
 import { TaskMessageModule } from './task-message/task-message.module';
 import { HealthModule } from './health/health.module';
+import { SmsModule } from './sms/sms.module';
+import { OtpModule } from './otp/otp.module';
 
 @Module({
   imports: [
@@ -62,6 +64,8 @@ import { HealthModule } from './health/health.module';
     WebhookModule,
     TaskMessageModule,
     HealthModule,
+    SmsModule,
+    OtpModule,
   ],
 })
 export class AppModule {}

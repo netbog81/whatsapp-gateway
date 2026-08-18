@@ -40,4 +40,21 @@ export class BaoService implements OnModuleInit {
       throw error;
     }
   }
+
+  /**
+   * Scrive un segreto su OpenBao (KV v2) tramite Agent proxy.
+   * Sovrascrive l'intero set di campi al path indicato (comportamento KV v2:
+   * il write crea una nuova versione con SOLO i campi passati).
+   * Richiede capability create/update sulla policy dell'AppRole dell'agent.
+   * @param path - es. "whatsapp/bdq/evolution_apikey"
+   * @param data - campi del segreto, es. { api_key: "..." }
+   */
+  async writeSecret(path: string, data: Record<string, any>): Promise<void> {
+    try {
+      await (this.openbao as any).getClient().write(`kv/data/${path}`, { data });
+    } catch (error: any) {
+      this.logger.error(`Errore scrittura segreto ${path}: ${error.message}`);
+      throw error;
+    }
+  }
 }

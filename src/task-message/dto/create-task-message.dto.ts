@@ -1,13 +1,26 @@
-import { IsString, IsUUID, IsOptional, IsDateString } from 'class-validator';
+import { IsString, IsUUID, IsOptional, IsDateString, Matches, MaxLength } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class CreateTaskMessageDto {
   @ApiProperty({
-    description: 'UUID dell\'utente destinatario',
+    description: 'UUID dell\'utente destinatario. Alternativo a recipientGroup: esattamente uno dei due.',
+    required: false,
     example: '550e8400-e29b-41d4-a716-446655440001',
   })
+  @IsOptional()
   @IsUUID('all')
-  recipientUserId: string;
+  recipientUserId?: string;
+
+  @ApiProperty({
+    description: 'Gruppo destinatario (es. "secretary"): il messaggio è visibile a tutti i membri del gruppo lato Main App. Alternativo a recipientUserId: esattamente uno dei due.',
+    required: false,
+    example: 'secretary',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(50)
+  @Matches(/^[a-z0-9_-]+$/, { message: 'recipientGroup deve essere uno slug minuscolo' })
+  recipientGroup?: string;
 
   @ApiProperty({
     description: 'UUID dell\'utente mittente',

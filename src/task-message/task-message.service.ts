@@ -18,6 +18,10 @@ const taskMetaKey = (tenantId: string, messageId: string) =>
 const inboxIndexKey = (tenantId: string, userId: string) =>
   `task_inbox:${tenantId}:${userId}`;
 
+/** Chiave Redis per indice inbox di gruppo (es. "secretary") */
+const groupInboxIndexKey = (tenantId: string, group: string) =>
+  `task_inbox:${tenantId}:group:${group}`;
+
 /** Chiave Redis per indice sent mittente */
 const sentIndexKey = (tenantId: string, userId: string) =>
   `task_sent:${tenantId}:${userId}`;
@@ -29,7 +33,8 @@ interface TaskMessageMeta {
   message_id: string;
   tenant_id: string;
   sender_user_id: string;
-  recipient_user_id: string;
+  recipient_user_id: string | null;
+  recipient_group: string | null;
   content_encrypted: string;
   status: TaskMessageStatus;
   available_from: string | null;
@@ -62,6 +67,13 @@ export class TaskMessageService {
     tenantId: string,
     ipAddress: string,
   ): Promise<{ messageId: string; status: TaskMessageStatus }> {
+    // Esattamente uno tra destinatario singolo e gruppo
+    if (!dto.recipientUserId === !dto.recipientGroup) {
+      throw new BadRequestException(
+        'Specificare esattamente uno tra recipientUserId e recipientGroup',
+      );
+    }
+
     const messageId = uuidv4();
     const correlationId = dto.correlationId || uuidv4();
     const now = new Date().toISOString();
@@ -97,7 +109,8 @@ export class TaskMessageService {
       message_id: messageId,
       tenant_id: tenantId,
       sender_user_id: dto.senderUserId,
-      recipient_user_id: dto.recipientUserId,
+      recipient_user_id: dto.recipientUserId || null,
+      recipient_group: dto.recipientGroup || null,
       content_encrypted: contentEncrypted,
       status,
       available_from: dto.availableFrom || null,
@@ -115,7 +128,7 @@ export class TaskMessageService {
     // Aggiungi agli indici
     await this.redis.sadd(sentIndexKey(tenantId, dto.senderUserId), messageId);
     if (status === TaskMessageStatus.AVAILABLE) {
-      await this.redis.sadd(inboxIndexKey(tenantId, dto.recipientUserId), messageId);
+      await this.redis.sadd(this.inboxKeyFor(tenantId, meta), messageId);
     }
 
     // Audit
@@ -126,7 +139,12 @@ export class TaskMessageService {
       actor: { user_id: dto.senderUserId, ip_address: ipAddress },
       resource: { entity: 'TASK_MESSAGE', id: messageId },
       status: 'SUCCESS',
-      payload: { recipientUserId: dto.recipientUserId, status, availableFrom: dto.availableFrom },
+      payload: {
+        recipientUserId: dto.recipientUserId || null,
+        recipientGroup: dto.recipientGroup || null,
+        status,
+        availableFrom: dto.availableFrom,
+      },
     });
 
     // Webhook alla main app
@@ -136,7 +154,8 @@ export class TaskMessageService {
       correlationId,
       messageId,
       senderUserId: dto.senderUserId,
-      recipientUserId: dto.recipientUserId,
+      recipientUserId: dto.recipientUserId || null,
+      recipientGroup: dto.recipientGroup || null,
       content: dto.content,
       status,
       availableFrom: dto.availableFrom || null,
@@ -225,6 +244,7 @@ export class TaskMessageService {
       messageId,
       senderUserId: meta.sender_user_id,
       recipientUserId: meta.recipient_user_id,
+      recipientGroup: meta.recipient_group,
       content: dto.content || this.encryptionService.decrypt(meta.content_encrypted),
       status: meta.status,
       availableFrom: meta.available_from,
@@ -276,7 +296,7 @@ export class TaskMessageService {
 
     // Rimuovi dagli indici inbox se era AVAILABLE
     if (previousStatus === TaskMessageStatus.AVAILABLE) {
-      await this.redis.srem(inboxIndexKey(tenantId, meta.recipient_user_id), messageId);
+      await this.redis.srem(this.inboxKeyFor(tenantId, meta), messageId);
     }
 
     // Audit
@@ -298,6 +318,7 @@ export class TaskMessageService {
       messageId,
       senderUserId: meta.sender_user_id,
       recipientUserId: meta.recipient_user_id,
+      recipientGroup: meta.recipient_group,
       content: null,
       status: TaskMessageStatus.DELETED,
       availableFrom: meta.available_from,
@@ -318,7 +339,9 @@ export class TaskMessageService {
   ): Promise<{ status: string }> {
     const meta = await this.getMeta(tenantId, messageId);
 
-    if (meta.recipient_user_id !== recipientUserId) {
+    // Per i messaggi di gruppo l'appartenenza al gruppo è verificata dalla
+    // Main App (il gateway non conosce gli utenti del tenant).
+    if (!meta.recipient_group && meta.recipient_user_id !== recipientUserId) {
       throw new ForbiddenException('Solo il destinatario può segnare il messaggio come letto');
     }
     if (meta.status !== TaskMessageStatus.AVAILABLE) {
@@ -353,6 +376,7 @@ export class TaskMessageService {
       messageId,
       senderUserId: meta.sender_user_id,
       recipientUserId: meta.recipient_user_id,
+      recipientGroup: meta.recipient_group,
       content: this.encryptionService.decrypt(meta.content_encrypted),
       status: TaskMessageStatus.READ,
       availableFrom: meta.available_from,
@@ -373,7 +397,9 @@ export class TaskMessageService {
   ): Promise<{ status: string }> {
     const meta = await this.getMeta(tenantId, messageId);
 
-    if (meta.recipient_user_id !== recipientUserId) {
+    // Per i messaggi di gruppo l'appartenenza al gruppo è verificata dalla
+    // Main App (il gateway non conosce gli utenti del tenant).
+    if (!meta.recipient_group && meta.recipient_user_id !== recipientUserId) {
       throw new ForbiddenException('Solo il destinatario può completare il task');
     }
     if (meta.status !== TaskMessageStatus.READ) {
@@ -396,7 +422,7 @@ export class TaskMessageService {
     );
 
     // Rimuovi dagli indici
-    await this.redis.srem(inboxIndexKey(tenantId, meta.recipient_user_id), messageId);
+    await this.redis.srem(this.inboxKeyFor(tenantId, meta), messageId);
 
     // Audit
     await this.auditService.log({
@@ -417,6 +443,7 @@ export class TaskMessageService {
       messageId,
       senderUserId: meta.sender_user_id,
       recipientUserId: meta.recipient_user_id,
+      recipientGroup: meta.recipient_group,
       content: this.encryptionService.decrypt(meta.content_encrypted),
       status: TaskMessageStatus.COMPLETED,
       availableFrom: meta.available_from,
@@ -458,8 +485,8 @@ export class TaskMessageService {
 
     await this.redis.set(key, JSON.stringify(meta));
 
-    // Aggiungi all'indice inbox del destinatario
-    await this.redis.sadd(inboxIndexKey(tenantId, meta.recipient_user_id), messageId);
+    // Aggiungi all'indice inbox del destinatario (o del gruppo)
+    await this.redis.sadd(this.inboxKeyFor(tenantId, meta), messageId);
 
     // Audit
     await this.auditService.log({
@@ -469,7 +496,7 @@ export class TaskMessageService {
       actor: { user_id: 'SYSTEM', ip_address: 'internal' },
       resource: { entity: 'TASK_MESSAGE', id: messageId },
       status: 'SUCCESS',
-      payload: { recipientUserId: meta.recipient_user_id },
+      payload: { recipientUserId: meta.recipient_user_id, recipientGroup: meta.recipient_group },
     });
 
     // Webhook: notifica che il messaggio è ora disponibile
@@ -480,6 +507,7 @@ export class TaskMessageService {
       messageId,
       senderUserId: meta.sender_user_id,
       recipientUserId: meta.recipient_user_id,
+      recipientGroup: meta.recipient_group,
       content: this.encryptionService.decrypt(meta.content_encrypted),
       status: TaskMessageStatus.AVAILABLE,
       availableFrom: meta.available_from,
@@ -523,6 +551,13 @@ export class TaskMessageService {
 
   // --- Helpers privati ---
 
+  /** Indice inbox corretto: per-utente o per-gruppo. */
+  private inboxKeyFor(tenantId: string, meta: TaskMessageMeta): string {
+    return meta.recipient_group
+      ? groupInboxIndexKey(tenantId, meta.recipient_group)
+      : inboxIndexKey(tenantId, meta.recipient_user_id as string);
+  }
+
   private async getMeta(tenantId: string, messageId: string): Promise<TaskMessageMeta> {
     const raw = await this.redis.get(taskMetaKey(tenantId, messageId));
     if (!raw) {
@@ -546,6 +581,7 @@ export class TaskMessageService {
         messageId: meta.message_id,
         senderUserId: meta.sender_user_id,
         recipientUserId: meta.recipient_user_id,
+        recipientGroup: meta.recipient_group ?? null,
         content: this.encryptionService.decrypt(meta.content_encrypted),
         status: meta.status,
         availableFrom: meta.available_from,
@@ -571,7 +607,8 @@ export class TaskMessageService {
     correlationId: string;
     messageId: string;
     senderUserId: string;
-    recipientUserId: string;
+    recipientUserId: string | null;
+    recipientGroup: string | null;
     content: string | null;
     status: TaskMessageStatus;
     availableFrom: string | null;
@@ -589,6 +626,7 @@ export class TaskMessageService {
         tenant_id: params.tenantId,
         sender_user_id: params.senderUserId,
         recipient_user_id: params.recipientUserId,
+        recipient_group: params.recipientGroup,
         content: params.content,
         status: params.status,
         available_from: params.availableFrom,

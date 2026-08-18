@@ -98,13 +98,22 @@ export class WebhookProcessor extends WorkerHost {
       gatewayMetadata = gateway_metadata_override;
     } else {
       // Webhook da Evolution/RabbitMQ — costruisce da msg_metadata + evento
+      const isInbound = msg_metadata?.message_type === 'chat_inbound';
+      const isExternalOutbound = msg_metadata?.message_type === 'chat_outbound_external';
       gatewayMetadata = {
         message_type: msg_metadata?.message_type ?? null,
         correlation_id: msg_metadata?.correlation_id ?? correlationId,
         tenant_id: tenantId,
         patient_id: msg_metadata?.patient_id ?? null,
         appointment_ids: msg_metadata?.appointment_ids ?? [],
-        status: this.mapEvolutionStatus(event),
+        // Solo per la chat: conversazione di appartenenza, così la Main App
+        // attribuisce gli stati senza cercare per numero.
+        ...(msg_metadata?.conversation_id ? { conversation_id: msg_metadata.conversation_id } : {}),
+        // Un messaggio in arrivo non ha uno stato di consegna nostro: mapparlo
+        // su SENT (come farebbe mapEvolutionStatus per messages.upsert) sarebbe
+        // fuorviante. Quello scritto dal telefono dello studio invece è, di
+        // fatto, già inviato.
+        status: isInbound ? 'RECEIVED' : isExternalOutbound ? 'SENT' : this.mapEvolutionStatus(event),
         timestamp: new Date().toISOString(),
       };
     }

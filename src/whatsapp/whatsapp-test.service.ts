@@ -89,8 +89,9 @@ export class WhatsappTestService {
       name: name || 'Paziente Test',
     };
 
-    // 1. Inserisce nel buffer Redis (cifrato, come in produzione)
-    const recapKey = `pending:${tenantId}:${pazienteId}`;
+    // 1. Inserisce nel buffer Redis (cifrato, come in produzione).
+    // Chiave per numero di telefono: stessa di WhatsappService/WhatsappProcessor.
+    const recapKey = `pending:${tenantId}:${phone}`;
     const encryptedData = this.encryptionService.encrypt(JSON.stringify(appointmentData));
     await this.redis.rpush(recapKey, encryptedData);
     await this.redis.expire(recapKey, RECAP_TTL_SECONDS);
@@ -154,7 +155,7 @@ export class WhatsappTestService {
       { offsetDays: 3, hour: 11, minute: 0,  label: '3' },
     ];
 
-    const recapKey = `pending:${tenantId}:${pazienteId}`;
+    const recapKey = `pending:${tenantId}:${phone}`;
     const scheduledReminders = [];
 
     for (const appt of appointments) {

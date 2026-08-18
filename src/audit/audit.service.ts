@@ -5,9 +5,13 @@ export type AuditEventType =
   | 'REQUEST_RECEIVED'
   | 'MESSAGE_DISPATCHED'
   | 'RECAP_GENERATED'
+  /** Recap tolto dal buffer perché l'appuntamento è stato disdetto prima dell'invio. */
+  | 'RECAP_SUPPRESSED'
   | 'REMINDER_SCHEDULED'
   | 'REMINDER_CANCELLED'
+  | 'APPOINTMENT_UPDATED'
   | 'CANCEL_NOTIFICATION_QUEUED'
+  | 'SCHEDULED_MESSAGE_CANCELLED'
   | 'WEBHOOK_RETRY'
   | 'INTERNAL_TASK_QUEUED'
   | 'TASK_MESSAGE_CREATED'
@@ -16,6 +20,9 @@ export type AuditEventType =
   | 'TASK_MESSAGE_READ'
   | 'TASK_MESSAGE_COMPLETED'
   | 'TASK_MESSAGE_DELETED'
+  | 'OTP_DISPATCHED'
+  | 'OTP_FALLBACK'
+  | 'EVOLUTION_KEY_UPDATED'
   | 'ERROR';
 
 export type AuditStatus = 'SUCCESS' | 'FAILED' | 'PENDING';

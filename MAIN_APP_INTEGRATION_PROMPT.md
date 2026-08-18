@@ -30,7 +30,7 @@ CREATE TABLE whatsapp_tenant_config (
   gateway_url VARCHAR(500) NOT NULL,               -- URL base del gateway (es. "http://message_gateway:3000")
   gateway_api_key VARCHAR(500) NOT NULL,           -- API key con cui la main-app chiama il gateway (CIFRATA a riposo)
   is_active BOOLEAN NOT NULL DEFAULT true,
-  recap_delay_seconds INT NOT NULL DEFAULT 60,     -- Buffer recap (default 60s, non modificabile lato gateway)
+  recap_delay_seconds INT NOT NULL DEFAULT 60,     -- Buffer recap 30-600s, inviato al gateway come recapDelaySeconds
   reminder_hours_before INT NOT NULL DEFAULT 24,   -- Ore prima per reminder (informativo, logica nel gateway)
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -44,7 +44,7 @@ Template messaggi personalizzabili per-tenant.
 CREATE TABLE whatsapp_message_template (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id VARCHAR(100) NOT NULL,
-  template_type VARCHAR(50) NOT NULL,              -- 'RECAP_SINGLE' | 'RECAP_MULTI' | 'REMINDER_24H'
+  template_type VARCHAR(50) NOT NULL,              -- 'RECAP_SINGLE' | 'RECAP_MULTI' | 'REMINDER_24H' | 'CANCELLATION' | 'UPDATE'
   template_text TEXT NOT NULL,                     -- Testo con variabili: {name}, {date}, {time}, {appointments}
   is_active BOOLEAN NOT NULL DEFAULT true,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -162,7 +162,7 @@ async dispatchBooking(params: {
   patientId: string;
   patientName: string;
   phone: string;
-  date: string; // ISO 8601, es. "2026-03-15T10:30:00+01:00"
+  date: string; // ISO 8601 SENZA offset, es. "2026-03-15T10:30:00"
   userId: string;
   correlationId?: string;
 }): Promise<{ correlationId: string }>
@@ -184,14 +184,59 @@ Body:
     "appointmentId": "string",
     "pazienteId": "string",
     "phone": "39XXXXXXXXXX",
-    "date": "2026-03-15T10:30:00+01:00",
+    "date": "2026-03-15T10:30:00",
     "name": "Mario Rossi",
     "recapMessage": "Gentile Mario Rossi, confermiamo il suo appuntamento per il 15/03/2026 alle 10:30.",
-    "reminderMessage": "Promemoria: il suo appuntamento è domani alle 10:30."
+    "reminderMessage": "Promemoria: il suo appuntamento è domani alle 10:30.",
+    "recapMultiTemplate": "Gentile {name}, confermiamo i seguenti appuntamenti:\n{appointments}",
+    "recapLine": "- 15/03/2026 alle 10:30",
+    "recapDelaySeconds": 60
   },
   "correlationId": "uuid-opzionale"
 }
 ```
+
+**Formato di `date`: ora locale senza offset.** Il gateway interpreta la stringa
+in `Europe/Rome` applicando da sé l'ora legale. Un offset fisso (`+01:00`) manda
+in avanti di un'ora tutti i messaggi da fine marzo a fine ottobre.
+
+**Recap multiplo:** se nella finestra di raggruppamento arriva più di un
+appuntamento per lo stesso numero, il gateway compone il messaggio partendo da
+`recapMultiTemplate` (grezzo) sostituendo `{name}` e `{appointments}` con
+l'elenco delle `recapLine` bufferizzate. Il buffer è indicizzato per numero di
+telefono, così funziona anche per i walk-in senza anagrafica.
+
+**Finestra di raggruppamento (`recapDelaySeconds`, 30-600s, default 60):** è
+**scorrevole**, cioè riparte a ogni nuovo appuntamento per lo stesso numero —
+l'operatore non deve chiudere tutte le prenotazioni entro la prima finestra. Lo
+slittamento si ferma a `min(5 × finestra, 15 minuti)` dal primo appuntamento del
+gruppo, altrimenti una sequenza continua di prenotazioni rimanderebbe il recap
+all'infinito. Valori fuori range vengono normalizzati dal gateway.
+
+**Metodo: modifica appuntamento**
+```
+POST {gateway_url}/whatsapp/dispatch
+
+Body:
+{
+  "type": "APPOINTMENT_UPDATE",
+  "data": {
+    "appointmentId": "string",
+    "pazienteId": "string",
+    "phone": "39XXXXXXXXXX",
+    "date": "2026-03-16T11:00:00",          ← NUOVO orario
+    "name": "Mario Rossi",
+    "updateMessage": "Gentile Mario Rossi, il suo appuntamento è stato spostato al 16/03/2026 alle 11:00.",
+    "reminderMessage": "Promemoria: il suo appuntamento è domani alle 11:00.",
+    "sendUpdateNotification": true
+  },
+  "correlationId": "uuid-opzionale"
+}
+```
+
+Il gateway rimuove il reminder programmato sul vecchio orario, invia la notifica
+di spostamento (saltata con `sendUpdateNotification: false`) e riprogramma il
+reminder 24h sul nuovo orario. La notifica non passa dal buffer recap.
 
 **Metodo: cancellazione reminder**
 ```
@@ -460,7 +505,7 @@ input WhatsappConfigInput {
 
 input WhatsappTemplateInput {
   tenantId: String!
-  templateType: String!    # 'RECAP_SINGLE' | 'RECAP_MULTI' | 'REMINDER_24H'
+  templateType: String!    # 'RECAP_SINGLE' | 'RECAP_MULTI' | 'REMINDER_24H' | 'CANCELLATION' | 'UPDATE'
   templateText: String!
 }
 
