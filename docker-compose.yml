@@ -1,11 +1,37 @@
 version: '3.8'
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PREREQUISITI HOST (VM) — da rifare a ogni migrazione su una nuova macchina
+# ─────────────────────────────────────────────────────────────────────────────
+# `vm.overcommit_memory = 1` deve essere impostato sul KERNEL DELL'HOST.
+# `gateway_redis` (BullMQ) fa fork() per i salvataggi su disco (RDB/AOF): con
+# overcommit=0 (default) e poca RAM libera il kernel può negare la fork → il
+# background save fallisce → possibile CORRUZIONE AOF → Redis in crash-loop
+# infinito → gateway BullMQ morto → i webhook task-message/WhatsApp non tornano
+# più al clinico (incidente 2026-07-07).
+#
+# È un parametro KERNEL, NON namespaced: NON si può mettere nel container, vale
+# per tutta la VM. Il Redis in container eredita il valore dell'host.
+#
+#   echo 'vm.overcommit_memory = 1' | sudo tee /etc/sysctl.d/99-redis-overcommit.conf
+#   sudo sysctl -p /etc/sysctl.d/99-redis-overcommit.conf   # applica subito
+#   sysctl vm.overcommit_memory                             # verifica: = 1
+#
+# Il file in /etc/sysctl.d/ è persistente (riletto a ogni boot). Il servizio
+# gateway_redis qui sotto ha comunque un entrypoint di self-heal AOF come
+# seconda linea di difesa, ma il sysctl è la prevenzione alla radice.
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
   message-gateway:
     container_name: message_gateway
     build:
       context: .
       dockerfile: Dockerfile
+      # Credenziale di sola lettura per il package registry GitLab, da cui
+      # arriva @curandis/openbao-core. Vedi la sezione secrets in fondo.
+      secrets:
+        - npmrc
     restart: always
     ports:
       - "3005:3000"
@@ -35,16 +61,40 @@ services:
   # Redis dedicato al gateway con persistenza AOF abilitata.
   # Garantisce che i job BullMQ (reminder, recap, callback-webhook) sopravvivano
   # a crash o blackout. I dati vengono scritti su disco ogni secondo (appendfsync everysec).
+  #
+  # HARDENING (2026-07-07): auto-riparazione AOF all'avvio. Un AOF corrotto
+  # (es. kill non pulito durante una scrittura) faceva rifiutare l'avvio a Redis
+  # generando un crash-loop infinito e silenzioso (incidente: 2194 restart) che
+  # bloccava l'intero gateway BullMQ e quindi i webhook task-message verso il
+  # clinico. L'entrypoint ora esegue `redis-check-aof --fix` prima di partire:
+  # su AOF valido è un no-op, su AOF corrotto tronca al punto valido e Redis
+  # riparte in pochi secondi. Gli args di redis-server restano in `command`.
   gateway_redis:
     image: redis:7-alpine
     container_name: gateway_redis
     restart: always
-    command: >
-      redis-server
-      --appendonly yes
-      --appendfsync everysec
-      --maxmemory 256mb
-      --maxmemory-policy noeviction
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        MANIFEST=/data/appendonlydir/appendonly.aof.manifest
+        if [ -f "$$MANIFEST" ]; then
+          echo "[redis-boot] Verifica integrità AOF ($$MANIFEST)...";
+          yes | redis-check-aof --fix "$$MANIFEST" \
+            || echo "[redis-boot] redis-check-aof exit non-zero, proseguo con l'avvio";
+        fi
+        exec docker-entrypoint.sh "$$@"
+      - redis-self-heal
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
     volumes:
       - gateway_redis_data:/data
     networks:
@@ -63,3 +113,11 @@ volumes:
 networks:
   evolution-net:
     external: true
+
+# ── Secrets di build ────────────────────────────────────────────
+# Credenziale di sola lettura per il package registry GitLab (project 4).
+# File fuori dal repo, così non può finire in un commit. Deploy token con il
+# solo scope read_package_registry.
+secrets:
+  npmrc:
+    file: /home/marco/.curandis/npmrc-build
