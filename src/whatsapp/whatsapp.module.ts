@@ -10,12 +10,14 @@ import { WhatsappProcessor } from './whatsapp.processor';
 import { WhatsappTestService } from './whatsapp-test.service';
 import { AuthModule } from '../auth/auth.module'; // Per il Guard
 import { AuditModule } from '../audit/audit.module'; // Per l'Audit
+import { DeliveryModule } from '../delivery/delivery.module'; // Consegna multicanale
 
 @Module({
   imports: [
     HttpModule, // Per chiamare Evolution API
     AuthModule,
     AuditModule,
+    DeliveryModule,
     
     // Registrazione delle Code
     BullModule.registerQueue({

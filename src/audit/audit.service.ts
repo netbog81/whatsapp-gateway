@@ -4,9 +4,13 @@ import * as crypto from 'crypto';
 export type AuditEventType =
   | 'REQUEST_RECEIVED'
   | 'MESSAGE_DISPATCHED'
+  /** Consegnato da un canale di riserva perché il primo aveva fallito. */
+  | 'MESSAGE_FALLBACK'
   | 'RECAP_GENERATED'
   /** Recap tolto dal buffer perché l'appuntamento è stato disdetto prima dell'invio. */
   | 'RECAP_SUPPRESSED'
+  /** Recap corretto nel buffer perché l'appuntamento è stato spostato prima dell'invio. */
+  | 'RECAP_REWRITTEN'
   | 'REMINDER_SCHEDULED'
   | 'REMINDER_CANCELLED'
   | 'APPOINTMENT_UPDATED'

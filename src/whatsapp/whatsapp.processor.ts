@@ -1,5 +1,5 @@
-import { Processor, WorkerHost } from '@nestjs/bullmq';
-import { Job } from 'bullmq';
+import { Processor, WorkerHost, InjectQueue } from '@nestjs/bullmq';
+import { Job, Queue } from 'bullmq';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { Logger } from '@nestjs/common';
@@ -11,6 +11,20 @@ import { v4 as uuidv4 } from 'uuid';
 import { BaoService } from '../auth/bao.service';
 import { AuditService } from '../audit/audit.service';
 import { EncryptionService } from '../common/encryption.service';
+import {
+  ChannelDeliveryService,
+  DeliveryChannel,
+  NoUsableChannelError,
+} from '../delivery/channel-delivery.service';
+import {
+  RecapKind,
+  recapKeys,
+  recapKindOfJob,
+  recapMessageType,
+  earlierKinds,
+  RECAP_DEFER_MARGIN_MS,
+  RECAP_MAX_DEFERRALS,
+} from './recap-buffer';
 
 const RATE_LIMIT_KEY = (tenantId: string) => `ratelimit:evolution:${tenantId}`;
 const MIN_INTERVAL_MS = 10000; // 10 secondi per tenant
@@ -21,6 +35,83 @@ const MIN_INTERVAL_MS = 10000; // 10 secondi per tenant
  * Evolution per non finire in flood.
  */
 const MIN_INTERVAL_CHAT_MS = 1500;
+
+/**
+ * Data e ora di un appuntamento in ora locale italiana.
+ *
+ * Le date arrivano SENZA offset proprio perché vanno lette in Europe/Rome:
+ * un offset fisso sballerebbe di un'ora tutti i messaggi da fine marzo a fine
+ * ottobre.
+ */
+const fmtLong = (iso: string) => {
+  const dt = DateTime.fromISO(iso, { zone: 'Europe/Rome' });
+  return dt.isValid ? `${dt.toFormat('dd/MM/yyyy')} alle ${dt.toFormat('HH:mm')}` : '';
+};
+
+/** Forma compatta, per le righe che affiancano due orari con una freccia. */
+const fmtShort = (iso: string) => {
+  const dt = DateTime.fromISO(iso, { zone: 'Europe/Rome' });
+  return dt.isValid ? dt.toFormat('dd/MM/yyyy HH:mm') : '';
+};
+
+/**
+ * Da dove pescare i testi di un raggruppamento, e cosa scrivere se la main-app
+ * non ne ha mandato nessuno.
+ *
+ * I fallback non sono decorazione: se il tenant disattiva un template il
+ * paziente deve comunque ricevere una frase sensata, non un messaggio vuoto.
+ */
+interface RecapTextSpec {
+  /** Campo col messaggio già renderizzato, usato quando l'appuntamento è uno solo. */
+  singleField: string;
+  /** Campo con la riga di questo appuntamento dentro l'elenco. */
+  lineField: string;
+  /** Campo col template dell'elenco, grezzo: `{name}` e `{appointments}`. */
+  multiField: string;
+  fallbackSingle(appt: any): string;
+  fallbackLine(appt: any): string;
+  fallbackMulti(first: any, lines: string[]): string;
+}
+
+const RECAP_TEXT_SPEC: Record<RecapKind, RecapTextSpec> = {
+  booking: {
+    singleField: 'recapMessage',
+    lineField: 'recapLine',
+    multiField: 'recapMultiTemplate',
+    fallbackSingle: appt =>
+      `Gentile ${appt.name}, confermiamo il suo appuntamento per il ${fmtLong(appt.date)}.`,
+    fallbackLine: appt => `- ${fmtLong(appt.date)}`,
+    fallbackMulti: (first, lines) =>
+      `Gentile ${first.name}, confermiamo i seguenti appuntamenti:\n${lines.join('\n')}`,
+  },
+  update: {
+    singleField: 'updateMessage',
+    lineField: 'updateLine',
+    multiField: 'updateMultiTemplate',
+    fallbackSingle: appt =>
+      `Gentile ${appt.name}, il suo appuntamento è stato spostato al ${fmtLong(appt.date)}.`,
+    // Con più spostamenti insieme il solo orario nuovo non basta: il paziente
+    // deve poter riconoscere QUALE dei suoi appuntamenti si è mosso.
+    fallbackLine: appt =>
+      appt.previousDate
+        ? `- ${fmtShort(appt.previousDate)} → ${fmtShort(appt.date)}`
+        : `- ${fmtLong(appt.date)}`,
+    fallbackMulti: (first, lines) =>
+      `Gentile ${first.name}, i suoi appuntamenti sono stati spostati:\n${lines.join('\n')}`,
+  },
+  cancel: {
+    singleField: 'cancelNotificationMessage',
+    lineField: 'cancelLine',
+    multiField: 'cancelMultiTemplate',
+    fallbackSingle: appt =>
+      appt.date && appt.name
+        ? `Gentile ${appt.name}, il suo appuntamento del ${fmtLong(appt.date)} è stato cancellato.`
+        : 'Il suo appuntamento è stato cancellato.',
+    fallbackLine: appt => `- ${fmtLong(appt.date)}`,
+    fallbackMulti: (first, lines) =>
+      `Gentile ${first.name}, i seguenti appuntamenti sono stati cancellati:\n${lines.join('\n')}`,
+  },
+};
 
 @Processor('whatsapp-queue', {
   concurrency: 1,
@@ -35,6 +126,12 @@ export class WhatsappProcessor extends WorkerHost {
     private readonly baoService: BaoService,
     private readonly auditService: AuditService,
     private readonly encryptionService: EncryptionService,
+    // Consegna multicanale: usata solo dai job che portano un piano di canali.
+    // Senza piano il percorso resta quello di sempre, solo WhatsApp.
+    private readonly channelDelivery: ChannelDeliveryService,
+    // Serve a rimettersi in coda: un raggruppamento che scade mentre uno che
+    // deve precederlo è ancora in attesa si fa da parte invece di scavalcarlo.
+    @InjectQueue('whatsapp-queue') private readonly whatsappQueue: Queue,
   ) {
     super();
   }
@@ -53,16 +150,30 @@ export class WhatsappProcessor extends WorkerHost {
       return this.handleInternalTask(job.data);
     }
 
-    const evolutionToken = await this.getTenantEvolutionToken(tenantId);
-    if (!evolutionToken) {
+    // Il token serve solo a chi passa da WhatsApp. Pretenderlo per ogni job
+    // impedirebbe a un tenant che usa solo SMS o email di mandare qualsiasi
+    // cosa: il canale sarebbe configurato e la coda fallirebbe lo stesso.
+    const usesWhatsapp = !Array.isArray(job.data.channels)
+      || job.data.channels.includes('whatsapp');
+    const evolutionToken = usesWhatsapp ? await this.getTenantEvolutionToken(tenantId) : null;
+    if (usesWhatsapp && !evolutionToken) {
       throw new Error(`Nessun token Evolution trovato per il tenant ${tenantId}`);
     }
 
+    // Prenotazioni, spostamenti e disdette hanno tre timer distinti ma un solo
+    // percorso: cambia solo da quale buffer si pesca e con quali testi.
+    const recapKind = recapKindOfJob(job.name);
+    if (recapKind) {
+      return this.sendRecap(recapKind, job, evolutionToken);
+    }
+
     switch (job.name) {
-      case 'process-recap':
-        return this.sendRecap(job.data, evolutionToken);
       case 'send-reminder':
-        return this.sendToEvolution(job.data, evolutionToken);
+        // Un promemoria puo' viaggiare su piu' canali; la chat no, per
+        // definizione: e' una conversazione WhatsApp.
+        return Array.isArray(job.data.channels) && job.data.channels.length
+          ? this.deliverMultichannel(job.data)
+          : this.sendToEvolution(job.data, evolutionToken);
       case 'send-chat':
         return this.sendToEvolution(job.data, evolutionToken);
       default:
@@ -110,23 +221,32 @@ export class WhatsappProcessor extends WorkerHost {
     await this.redis.set(rateLimitKey, Date.now().toString(), 'EX', 60);
   }
 
-  private async sendRecap(data: any, token: string) {
+  private async sendRecap(kind: RecapKind, job: Job, token: string) {
+    const data = job.data ?? {};
     const { tenantId, pazienteId, phone, recapMessage } = data;
-    // Chiave allineata a WhatsappService.handleBooking: si raggruppa per numero
-    // di telefono, non per pazienteId (vale anche per i walk-in senza anagrafica).
-    const recapKey = `pending:${tenantId}:${phone}`;
+    // Chiavi allineate a quelle che riempie WhatsappService: si raggruppa per
+    // numero di telefono, non per pazienteId (vale anche per i walk-in senza
+    // anagrafica, che avrebbero un id diverso per ogni appuntamento).
+    const { listKey, startKey } = recapKeys(kind, tenantId, phone);
     const startTime = Date.now();
 
-    const encryptedItems = await this.redis.lrange(recapKey, 0, -1);
+    const encryptedItems = await this.redis.lrange(listKey, 0, -1);
 
     if (encryptedItems.length === 0) {
-      this.logger.warn(`Nessun appuntamento in buffer per ${recapKey}`);
+      this.logger.warn(`Nessun appuntamento in buffer per ${listKey}`);
       return;
+    }
+
+    // Se per lo stesso numero deve ancora uscire un raggruppamento che viene
+    // prima, questo si rimette in coda: leggere "disdetto" prima di
+    // "confermiamo" è incomprensibile.
+    if (await this.deferBehindEarlierKinds(kind, job)) {
+      return { deferred: true };
     }
 
     // Chiude anche la finestra scorrevole: il prossimo appuntamento per questo
     // numero deve poter aprire un gruppo nuovo con il conteggio pieno.
-    await this.redis.del(recapKey, `recap_start:${tenantId}:${phone}`);
+    await this.redis.del(listKey, startKey);
 
     // Decifrare i dati prima dell'uso
     const appointments = encryptedItems.map(item => {
@@ -137,14 +257,29 @@ export class WhatsappProcessor extends WorkerHost {
       }
     });
 
-    const messageType = appointments.length === 1 ? 'single_recap' : 'multiple_recap';
-    const text = this.buildRecapText(appointments, recapMessage);
+    // Il buffer conserva l'ordine di CREAZIONE, che non e' quello in cui il
+    // paziente vivra' gli appuntamenti: chi prenota per ultimo l'8 gennaio e
+    // per primo il 20 gennaio si vedrebbe l'elenco al contrario.
+    const ordered = this.sortChronologically(appointments);
 
-    const appointmentIds = appointments.map((appt: any) => appt.appointmentId).filter(Boolean);
-    const recapCorrelationId = uuidv4();
+    const messageType = recapMessageType(kind, ordered.length);
+    const text = this.buildRecapText(kind, ordered, recapMessage);
+
+    const appointmentIds = ordered.map((appt: any) => appt.appointmentId).filter(Boolean);
+
+    // Con un solo appuntamento si riusa il correlationId con cui la main-app
+    // ha già aperto il proprio log, così la riconciliazione resta esatta.
+    // Nell'elenco multiplo non si può: gli id sarebbero più d'uno e nessuno
+    // rappresenterebbe il messaggio davvero inviato.
+    const recapCorrelationId =
+      ordered.length === 1 && ordered[0]?.correlationId ? ordered[0].correlationId : uuidv4();
 
     try {
-      const result = await this.sendToEvolution({
+      // Il raggruppamento resta per numero di telefono anche quando il
+      // messaggio uscira' via email o SMS: raggruppare e' una questione di
+      // "quante prenotazioni ha fatto questa persona adesso", non di come le
+      // verra' recapitato l'elenco.
+      const outgoing: Record<string, any> = {
         tenantId,
         phone,
         content: text,
@@ -152,7 +287,11 @@ export class WhatsappProcessor extends WorkerHost {
         correlationId: recapCorrelationId,
         pazienteId,
         appointmentIds,
-      }, token);
+        ...this.deliveryFieldsOf(data, messageType),
+      };
+      const result = Array.isArray(outgoing.channels) && outgoing.channels.length
+        ? await this.deliverMultichannel(outgoing)
+        : await this.sendToEvolution(outgoing, token);
       const processingTime = Date.now() - startTime;
 
       await this.auditService.log({
@@ -162,10 +301,13 @@ export class WhatsappProcessor extends WorkerHost {
         actor: { user_id: 'SYSTEM', ip_address: 'internal' },
         resource: { entity: 'PATIENT', id: pazienteId },
         status: 'SUCCESS',
-        payload: { appointmentCount: appointments.length, appointmentIds },
+        payload: { kind, appointmentCount: ordered.length, appointmentIds },
         metadata: {
           processing_time_ms: processingTime,
-          evolution_message_id: result?.key?.id,
+          // Due forme possibili: Evolution risponde annidato, il motore
+          // multicanale restituisce l'id gia' estratto.
+          evolution_message_id: result?.key?.id ?? result?.providerMessageId,
+          ...(result?.channel ? { channel: result.channel, used_fallback: result.usedFallback } : {}),
         },
       });
 
@@ -186,43 +328,254 @@ export class WhatsappProcessor extends WorkerHost {
   }
 
   /**
-   * Compone il testo del recap a partire dagli appuntamenti bufferizzati.
+   * Rimette in coda questo raggruppamento se per lo stesso numero ne deve
+   * ancora uscire uno che viene prima (prenotazioni → spostamenti → disdette).
    *
-   * I testi arrivano dalla main-app, che è l'unica a conoscere i template del
-   * tenant: ogni appuntamento porta con sé il proprio `recapMessage` (recap
-   * singolo già renderizzato) e la propria `recapLine` (riga per il recap
-   * multiplo). Il template multiplo (`recapMultiTemplate`) viaggia grezzo,
-   * perché l'elenco è noto solo qui alla chiusura della finestra di buffer.
+   * Il controllo si fa QUI e non al momento di programmare il timer perché la
+   * finestra è scorrevole: una prenotazione che arriva dopo sposta in avanti
+   * il proprio recap, e un ordine deciso in anticipo sarebbe già scaduto.
    *
-   * `jobRecapMessage` è il testo presente sul job `process-recap`: appartiene
-   * al PRIMO appuntamento della finestra (BullMQ ignora gli add successivi con
-   * lo stesso jobId), quindi vale solo come fallback per il recap singolo.
+   * Non può girare a vuoto: la finestra che precede ha un tetto proprio (15
+   * minuti), e comunque dopo `RECAP_MAX_DEFERRALS` rinvii si parte comunque.
    */
-  private buildRecapText(appointments: any[], jobRecapMessage?: string): string {
-    const first = appointments[0];
-    const fmt = (iso: string) => DateTime.fromISO(iso, { zone: 'Europe/Rome' });
+  private async deferBehindEarlierKinds(kind: RecapKind, job: Job): Promise<boolean> {
+    const earlier = earlierKinds(kind);
+    if (earlier.length === 0) return false;
 
-    if (appointments.length === 1) {
-      const custom = first.recapMessage ?? jobRecapMessage;
-      if (custom) return custom;
-      const dt = fmt(first.date);
-      return `Gentile ${first.name}, confermiamo il suo appuntamento per il ${dt.toFormat('dd/MM/yyyy')} alle ${dt.toFormat('HH:mm')}.`;
+    const { tenantId, phone } = job.data ?? {};
+    if (!phone) return false;
+
+    const deferCount = job.data?.deferCount ?? 0;
+    if (deferCount >= RECAP_MAX_DEFERRALS) {
+      this.logger.warn(
+        `Recap ${kind} ${tenantId}/${phone}: ${deferCount} rinvii, parte comunque`,
+      );
+      return false;
     }
 
-    const lines = appointments.map(appt => {
-      if (appt.recapLine) return appt.recapLine;
-      const dt = fmt(appt.date);
-      return `- ${dt.toFormat('dd/MM/yyyy')} alle ${dt.toFormat('HH:mm')}`;
-    });
+    let waitMs = 0;
+    for (const other of earlier) {
+      const timer = await this.whatsappQueue.getJob(recapKeys(other, tenantId, phone).jobId);
+      if (!timer) continue;
+      const remaining = timer.timestamp + (timer.delay ?? 0) - Date.now();
+      if (remaining > waitMs) waitMs = remaining;
+    }
 
-    const multiTemplate = appointments.find(appt => appt.recapMultiTemplate)?.recapMultiTemplate;
+    // Nessuno davanti, o sta già partendo: alla distanza fra i due invii pensa
+    // la coda, che ha un solo worker e li serve in ordine.
+    if (waitMs <= 0) return false;
+
+    const next = deferCount + 1;
+    await this.whatsappQueue.add(
+      job.name,
+      { ...job.data, deferCount: next },
+      {
+        delay: waitMs + RECAP_DEFER_MARGIN_MS,
+        // Id distinto: quello canonico appartiene a QUESTO job, che è ancora
+        // attivo e quindi non riutilizzabile finché non completa.
+        jobId: `${recapKeys(kind, tenantId, phone).jobId}:defer:${next}`,
+        removeOnComplete: true,
+      },
+    );
+
+    this.logger.log(
+      `Recap ${kind} ${tenantId}/${phone} rinviato di ${waitMs + RECAP_DEFER_MARGIN_MS}ms: c'è un raggruppamento che deve uscire prima`,
+    );
+    return true;
+  }
+
+  /**
+   * Ordina gli appuntamenti bufferizzati dal piu' prossimo al piu' lontano.
+   *
+   * Le date arrivano come ISO (`2026-02-15T10:30:00`), quindi il confronto
+   * fra stringhe e' gia' cronologico e non paga la costruzione di un Date per
+   * ogni elemento. Chi non ha `date` finisce in fondo invece di far esplodere
+   * il confronto.
+   */
+  private sortChronologically(appointments: any[]): any[] {
+    return [...appointments].sort((a, b) =>
+      String(a?.date ?? '\uffff').localeCompare(String(b?.date ?? '\uffff')),
+    );
+  }
+
+  /**
+   * Compone il testo di un raggruppamento a partire dagli appuntamenti
+   * bufferizzati.
+   *
+   * I testi arrivano dalla main-app, che è l'unica a conoscere i template del
+   * tenant: ogni appuntamento porta con sé il proprio messaggio singolo già
+   * renderizzato e la propria riga per l'elenco. Il template multiplo viaggia
+   * invece GREZZO, perché l'elenco è noto solo qui, alla chiusura della
+   * finestra di buffer.
+   *
+   * `jobMessage` è il testo presente sul job: appartiene al PRIMO appuntamento
+   * della finestra (BullMQ ignora gli add successivi con lo stesso jobId),
+   * quindi vale solo come fallback per il messaggio singolo.
+   */
+  private buildRecapText(kind: RecapKind, appointments: any[], jobMessage?: string): string {
+    const spec = RECAP_TEXT_SPEC[kind];
+    const first = appointments[0];
+
+    if (appointments.length === 1) {
+      const custom = first[spec.singleField] ?? jobMessage;
+      if (custom) return custom;
+      return spec.fallbackSingle(first);
+    }
+
+    const lines = appointments.map(appt => appt[spec.lineField] ?? spec.fallbackLine(appt));
+
+    const multiTemplate = appointments.find(appt => appt[spec.multiField])?.[spec.multiField];
     if (multiTemplate) {
       return multiTemplate
         .replace(/\{name\}/g, first.name ?? '')
         .replace(/\{appointments\}/g, lines.join('\n'));
     }
 
-    return `Gentile ${first.name}, confermiamo i seguenti appuntamenti:\n${lines.join('\n')}`;
+    return spec.fallbackMulti(first, lines);
+  }
+
+  /**
+   * Consegna un messaggio programmato provando i canali nell'ordine indicato.
+   *
+   * Il piano viaggia DENTRO il job: un promemoria messo in coda oggi per
+   * domani deve partire con le regole di oggi. Rileggere le impostazioni al
+   * momento dell'invio farebbe cambiare canale a messaggi gia' accettati,
+   * e nessuno saprebbe perche'.
+   *
+   * L'esito non fa fallire il job quando semplicemente non c'e' un recapito
+   * utilizzabile: non e' un guasto da ritentare, e' un paziente di cui non
+   * abbiamo l'indirizzo giusto.
+   */
+  /**
+   * Campi di consegna che il job si porta dietro, se la main-app ne ha indicati.
+   *
+   * `messageType` serve ai raggruppamenti: quando il job e' stato accodato non
+   * si sapeva ancora se il paziente avrebbe ricevuto un appuntamento o un
+   * elenco, quindi i testi di tutti i tipi sono viaggiati insieme e la scelta
+   * si fa qui, dove il tipo finalmente si conosce.
+   */
+  private deliveryFieldsOf(data: any, messageType?: string): Record<string, any> {
+    if (!Array.isArray(data?.channels) || !data.channels.length) return {};
+
+    const texts = messageType ? data?.channelTexts?.[messageType] : undefined;
+
+    return {
+      channels: data.channels,
+      ...(data.email ? { email: data.email } : {}),
+      ...(data.smsDriver ? { smsDriver: data.smsDriver } : {}),
+      ...(data.emailFromName ? { emailFromName: data.emailFromName } : {}),
+      // Il testo del tipo scelto vince su quello gia' presente nel job.
+      ...(data.emailSubject ? { emailSubject: data.emailSubject } : {}),
+      ...(data.emailBody ? { emailBody: data.emailBody } : {}),
+      ...(data.smsText ? { smsText: data.smsText } : {}),
+      ...(texts?.sms ? { smsText: texts.sms } : {}),
+      ...(texts?.emailSubject ? { emailSubject: texts.emailSubject } : {}),
+      ...(texts?.emailBody ? { emailBody: texts.emailBody } : {}),
+    };
+  }
+
+  private async deliverMultichannel(data: any) {
+    const startTime = Date.now();
+    const channels = data.channels as DeliveryChannel[];
+
+    try {
+      const outcome = await this.channelDelivery.deliver({
+        tenantId: data.tenantId,
+        channels,
+        phone: data.phone,
+        email: data.email,
+        smsDriver: data.smsDriver,
+        content: {
+          text: data.content,
+          subject: data.emailSubject,
+          smsText: data.smsText,
+          emailBody: data.emailBody,
+          emailFromName: data.emailFromName,
+        },
+        whatsappMinIntervalMs: MIN_INTERVAL_MS,
+        rateLimitKey: 'notify',
+      });
+
+      this.logger.log(
+        `Promemoria consegnato a ${outcome.recipientMasked} via ${outcome.channel}` +
+          `${outcome.usedFallback ? ' (canale di riserva)' : ''} per ${data.tenantId}`,
+      );
+
+      // Gli stati di consegna WhatsApp arrivano dal webhook e vanno attribuiti
+      // al messaggio giusto: stessi metadati del percorso a canale singolo.
+      if (outcome.channel === 'whatsapp' && outcome.providerMessageId && data.message_type) {
+        await this.redis.set(
+          `msg_meta:${data.tenantId}:${outcome.providerMessageId}`,
+          JSON.stringify({
+            message_type: data.message_type,
+            correlation_id: data.correlationId || 'unknown',
+            patient_id: data.pazienteId || 'unknown',
+            appointment_ids: data.appointmentIds || [],
+          }),
+          'EX',
+          172800,
+        );
+      }
+
+      await this.auditService.log({
+        tenantId: data.tenantId,
+        correlationId: data.correlationId || 'PROCESSOR',
+        eventType: outcome.usedFallback ? 'MESSAGE_FALLBACK' : 'MESSAGE_DISPATCHED',
+        actor: { user_id: 'SYSTEM', ip_address: 'internal' },
+        resource: { entity: 'APPOINTMENT', id: data.originalAppointmentId || 'N/A' },
+        status: 'SUCCESS',
+        payload: {
+          recipient: outcome.recipientMasked,
+          message_type: data.message_type || 'unknown',
+          channel: outcome.channel,
+          driver: outcome.driver,
+        },
+        metadata: {
+          processing_time_ms: Date.now() - startTime,
+          channel: outcome.channel,
+          driver: outcome.driver,
+          used_fallback: outcome.usedFallback,
+          skipped_channels: outcome.skipped,
+          provider_message_id: outcome.providerMessageId,
+        },
+      });
+
+      return {
+        channel: outcome.channel,
+        driver: outcome.driver,
+        providerMessageId: outcome.providerMessageId,
+        usedFallback: outcome.usedFallback,
+        message_type: data.message_type,
+      };
+    } catch (error: any) {
+      const noRecipient = error instanceof NoUsableChannelError;
+
+      await this.auditService.log({
+        tenantId: data.tenantId,
+        correlationId: data.correlationId || 'PROCESSOR',
+        eventType: 'ERROR',
+        actor: { user_id: 'SYSTEM', ip_address: 'internal' },
+        resource: { entity: 'APPOINTMENT', id: data.originalAppointmentId || 'N/A' },
+        status: 'FAILED',
+        payload: {
+          message_type: data.message_type || 'unknown',
+          channels,
+          skipped: error.skipped ?? [],
+          errorMessage: error.message,
+        },
+        metadata: { processing_time_ms: Date.now() - startTime, no_recipient: noRecipient },
+      });
+
+      if (noRecipient) {
+        // Ritentare non cambierebbe nulla: il recapito manca in anagrafica.
+        this.logger.warn(
+          `Promemoria non inviabile per ${data.tenantId}: ${error.message} — nessun ritentativo`,
+        );
+        return { skipped: true, reason: error.message, message_type: data.message_type };
+      }
+
+      throw error;
+    }
   }
 
   private async sendToEvolution(data: any, token: string) {

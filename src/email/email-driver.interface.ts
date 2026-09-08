@@ -11,6 +11,15 @@ export interface EmailSendInput {
   subject?: string;
   /** Corpo testuale. MAI loggare. */
   message: string;
+  /**
+   * Nome visualizzato del mittente, per questo messaggio.
+   *
+   * Sovrascrive quello della configurazione SMTP: e' il nome dello studio,
+   * che non e' un segreto e vive nelle impostazioni del modulo, non in
+   * OpenBao. Sul relay condiviso e' l'unico modo per cui il paziente veda
+   * la propria struttura invece della SaaS.
+   */
+  fromName?: string;
 }
 
 export interface EmailSendResult {

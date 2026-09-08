@@ -1,16 +1,19 @@
 import { BadGatewayException, Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { HttpService } from '@nestjs/axios';
-import { firstValueFrom } from 'rxjs';
 import { InjectRedis } from '@nestjs-modules/ioredis';
 import Redis from 'ioredis';
-import { BaoService } from '../auth/bao.service';
 import { AuditService } from '../audit/audit.service';
-import { PersonalGsmDriver } from '../sms/personal-gsm.driver';
-import { SkebbyDriver } from '../sms/skebby.driver';
-import { SmsDriver, SmsDriverName } from '../sms/sms-driver.interface';
+import { SmsDriverName } from '../sms/sms-driver.interface';
 import { SmtpDriver } from '../email/smtp.driver';
+import {
+  ChannelDeliveryService,
+  NoUsableChannelError,
+  maskEmail,
+  maskPhone,
+} from '../delivery/channel-delivery.service';
 import { OtpChannel, SendOtpDto, SendOtpResult } from './dto/send-otp.dto';
+
+/** Le funzioni di mascheramento restano esposte da qui: erano nate in questo file. */
+export { maskEmail, maskPhone };
 
 /** Intervallo minimo tra messaggi WhatsApp OTP dello stesso tenant (più corto dei recap: il paziente sta aspettando). */
 const OTP_WA_MIN_INTERVAL_MS = 2000;
@@ -26,107 +29,106 @@ export const OTP_TRACK_TTL_S = 3600;
  * è generato e verificato SOLO dal chiamante (modulo signature del
  * registry); qui arriva un testo opaco che non viene mai loggato.
  *
- * Priorità canali: dto.channelPriority (passata dal chiamante, fonte:
- * signature_tenant_configs del registry) → KV `sms/<tenant>/otp_config`
- * ({ primary_channel, fallback_channel, sms_driver }) → default
- * whatsapp→sms (ogni tenant oggi ha WhatsApp configurato).
+ * La consegna vera e propria — ordine dei canali, salto di quelli senza
+ * recapito, verifica del numero su WhatsApp — sta in
+ * `ChannelDeliveryService`, condivisa con i promemoria degli appuntamenti.
+ * Qui resta ciò che è dell'OTP e non della consegna: quale piano di canali
+ * usare e quali eventi di audit scrivere.
+ *
+ * Priorità canali: la manda il chiamante a ogni richiesta, leggendola da
+ * `signature_tenant_configs` del registry (colonne `otpChannels` e
+ * `smsDriver`). È lì che il tenant la modifica, ed è l'unica fonte: in
+ * OpenBao non c'è nessuna configurazione di canale, solo le credenziali dei
+ * provider.
  */
 @Injectable()
 export class OtpDeliveryService {
   private readonly logger = new Logger(OtpDeliveryService.name);
 
   constructor(
-    private readonly httpService: HttpService,
-    private readonly configService: ConfigService,
-    private readonly baoService: BaoService,
+    private readonly channelDelivery: ChannelDeliveryService,
     private readonly auditService: AuditService,
-    private readonly personalGsmDriver: PersonalGsmDriver,
-    private readonly skebbyDriver: SkebbyDriver,
     private readonly smtpDriver: SmtpDriver,
     @InjectRedis() private readonly redis: Redis,
   ) {}
 
   async send(tenantId: string, dto: SendOtpDto, ipAddress: string): Promise<SendOtpResult> {
-    const { channels, smsDriverName } = await this.resolvePlan(tenantId, dto);
+    const { channels, smsDriverName } = this.resolvePlan(dto);
     const correlationId = dto.correlationId ?? 'OTP';
     const startTime = Date.now();
 
-    // Canali privi del recapito necessario: saltati senza contare come
-    // errore. Con più canali eterogenei è la norma, non un'anomalia.
-    const usable: OtpChannel[] = [];
-    const skipped: string[] = [];
-    for (const channel of channels) {
-      if (!this.hasRecipient(channel, dto)) {
-        skipped.push(channel);
-        continue;
+    try {
+      const outcome = await this.channelDelivery.deliver({
+        tenantId,
+        channels,
+        phone: dto.phone,
+        email: dto.email,
+        smsDriver: smsDriverName,
+        content: { text: dto.message, subject: dto.subject },
+        whatsappMinIntervalMs: OTP_WA_MIN_INTERVAL_MS,
+        trackPrefix: OTP_TRACK_PREFIX,
+        trackTtlSeconds: OTP_TRACK_TTL_S,
+        rateLimitKey: 'otp',
+      });
+
+      const result: SendOtpResult = {
+        channel: outcome.channel as OtpChannel,
+        driver: outcome.driver,
+        providerMessageId: outcome.providerMessageId,
+        usedFallback: outcome.usedFallback,
+        recipientMasked: outcome.recipientMasked,
+      };
+
+      await this.auditService.log({
+        tenantId,
+        correlationId,
+        eventType: outcome.usedFallback ? 'OTP_FALLBACK' : 'OTP_DISPATCHED',
+        actor: { user_id: 'SYSTEM', ip_address: ipAddress },
+        resource: { entity: 'OTP', id: correlationId },
+        status: 'SUCCESS',
+        payload: {
+          recipient: outcome.recipientMasked,
+          channel: outcome.channel,
+          driver: outcome.driver,
+        },
+        metadata: {
+          processing_time_ms: Date.now() - startTime,
+          channel: outcome.channel,
+          driver: outcome.driver,
+          used_fallback: outcome.usedFallback,
+          skipped_channels: outcome.skipped,
+        },
+      });
+
+      return result;
+    } catch (error: any) {
+      // Nessun canale utilizzabile non è un guasto di consegna: nessuno ha
+      // provato niente, e l'audit di errore direbbe il falso.
+      if (error instanceof NoUsableChannelError) {
+        throw new BadGatewayException(error.message);
       }
-      // Un numero senza WhatsApp non produce errore da Evolution: senza
-      // questo controllo il cliente resterebbe senza codice.
-      if (channel === 'whatsapp' && (await this.isOnWhatsapp(tenantId, dto.phone!)) === false) {
-        skipped.push('whatsapp (numero non su WhatsApp)');
-        continue;
-      }
-      usable.push(channel);
-    }
-    if (skipped.length) {
-      this.logger.log(
-        `Canali saltati per mancanza di recapito (tenant ${tenantId}): ${skipped.join(', ')}`,
-      );
-    }
-    if (!usable.length) {
+
+      await this.auditService.log({
+        tenantId,
+        correlationId,
+        eventType: 'ERROR',
+        actor: { user_id: 'SYSTEM', ip_address: ipAddress },
+        resource: { entity: 'OTP', id: correlationId },
+        status: 'FAILED',
+        payload: {
+          channels: error.attempted ?? channels,
+          skipped: error.skipped ?? [],
+          errorMessage: error.lastError?.message ?? error.message,
+        },
+        metadata: { processing_time_ms: Date.now() - startTime },
+      });
+
       throw new BadGatewayException(
-        `Nessun canale utilizzabile: richiesti ${channels.join(', ')} ma mancano i recapiti corrispondenti`,
+        `Consegna OTP fallita su tutti i canali (${(error.attempted ?? channels).join(', ')}): ${
+          error.lastError?.message ?? error.message
+        }`,
       );
     }
-
-    let lastError: Error | null = null;
-    for (let i = 0; i < usable.length; i++) {
-      const channel = usable[i];
-      const recipientMasked = this.maskFor(channel, dto);
-      try {
-        const result = await this.sendVia(channel, tenantId, dto, smsDriverName);
-        const outcome: SendOtpResult = { ...result, channel, usedFallback: i > 0, recipientMasked };
-
-        await this.auditService.log({
-          tenantId,
-          correlationId,
-          eventType: i > 0 ? 'OTP_FALLBACK' : 'OTP_DISPATCHED',
-          actor: { user_id: 'SYSTEM', ip_address: ipAddress },
-          resource: { entity: 'OTP', id: correlationId },
-          status: 'SUCCESS',
-          payload: { recipient: recipientMasked, channel, driver: outcome.driver },
-          metadata: {
-            processing_time_ms: Date.now() - startTime,
-            channel,
-            driver: outcome.driver,
-            used_fallback: i > 0,
-            skipped_channels: skipped,
-          },
-        });
-        return outcome;
-      } catch (error: any) {
-        lastError = error;
-        this.logger.warn(
-          `Consegna OTP fallita su canale ${channel} per tenant ${tenantId}: ${error.message} — ${
-            i < usable.length - 1 ? 'provo fallback' : 'nessun altro canale'
-          }`,
-        );
-      }
-    }
-
-    await this.auditService.log({
-      tenantId,
-      correlationId,
-      eventType: 'ERROR',
-      actor: { user_id: 'SYSTEM', ip_address: ipAddress },
-      resource: { entity: 'OTP', id: correlationId },
-      status: 'FAILED',
-      payload: { channels: usable, skipped, errorMessage: lastError?.message },
-      metadata: { processing_time_ms: Date.now() - startTime },
-    });
-    throw new BadGatewayException(
-      `Consegna OTP fallita su tutti i canali (${usable.join(', ')}): ${lastError?.message}`,
-    );
   }
 
   /**
@@ -166,146 +168,6 @@ export class OtpDeliveryService {
     }
   }
 
-  /** Il canale ha il recapito che gli serve? */
-  private hasRecipient(channel: OtpChannel, dto: SendOtpDto): boolean {
-    return channel === 'email' ? !!dto.email : !!dto.phone;
-  }
-
-  /**
-   * Il numero è registrato su WhatsApp?
-   *
-   *   true  → registrato
-   *   false → NON registrato: il canale va saltato, altrimenti Evolution
-   *           accetta il messaggio e il cliente resta senza codice
-   *   null  → non determinabile (endpoint assente, errore, risposta
-   *           inattesa): si prosegue e si tenta l'invio come prima
-   *
-   * Il fail-open è deliberato: una diversa versione di Evolution deve
-   * degradare al comportamento precedente, non impedire la consegna.
-   * Esito in cache 24h — lo stato WhatsApp di un numero cambia di rado.
-   */
-  private async isOnWhatsapp(tenantId: string, phone: string): Promise<boolean | null> {
-    const digits = phone.replace(/\D/g, '');
-    const cacheKey = `wa_registered:${tenantId}:${digits}`;
-    const cached = await this.redis.get(cacheKey).catch(() => null);
-    if (cached === '1') return true;
-    if (cached === '0') return false;
-
-    try {
-      const token = await this.getEvolutionToken(tenantId);
-      if (!token) return null;
-      const evolutionUrl = this.configService.get<string>('EVOLUTION_API_URL');
-      const response = await firstValueFrom(
-        this.httpService.post(
-          `${evolutionUrl}/chat/whatsappNumbers/${tenantId}`,
-          { numbers: [digits] },
-          { headers: { apikey: token }, timeout: 8000 },
-        ),
-      );
-      const entry = Array.isArray(response.data) ? response.data[0] : null;
-      if (!entry || typeof entry.exists !== 'boolean') {
-        this.logger.warn(
-          `Verifica numero WhatsApp: risposta inattesa da Evolution per ${tenantId}, procedo comunque`,
-        );
-        return null;
-      }
-      await this.redis.set(cacheKey, entry.exists ? '1' : '0', 'EX', 86400).catch(() => undefined);
-      return entry.exists;
-    } catch (error: any) {
-      this.logger.warn(
-        `Verifica numero WhatsApp non riuscita per ${tenantId} (${error.message}): procedo comunque`,
-      );
-      return null;
-    }
-  }
-
-  private maskFor(channel: OtpChannel, dto: SendOtpDto): string {
-    return channel === 'email' ? maskEmail(dto.email ?? '') : maskPhone(dto.phone ?? '');
-  }
-
-  private async resolvePlan(
-    tenantId: string,
-    dto: SendOtpDto,
-  ): Promise<{ channels: OtpChannel[]; smsDriverName: SmsDriverName }> {
-    let channels = dto.channelPriority;
-    let smsDriverName = dto.smsDriver;
-
-    if (!channels || !smsDriverName) {
-      const config = await this.baoService.getSecret(`sms/${tenantId}/otp_config`);
-      if (!channels) {
-        if (config?.primary_channel) {
-          channels = [config.primary_channel];
-          if (config.fallback_channel && config.fallback_channel !== config.primary_channel) {
-            channels.push(config.fallback_channel);
-          }
-        } else {
-          channels = ['whatsapp', 'sms'];
-        }
-      }
-      smsDriverName = smsDriverName ?? config?.sms_driver ?? 'personal_gsm';
-    }
-
-    // dedup preservando l'ordine
-    return { channels: [...new Set(channels)], smsDriverName };
-  }
-
-  private async sendVia(
-    channel: OtpChannel,
-    tenantId: string,
-    dto: SendOtpDto,
-    smsDriverName: SmsDriverName,
-  ): Promise<Omit<SendOtpResult, 'channel' | 'usedFallback' | 'recipientMasked'>> {
-    if (channel === 'sms') {
-      const driver = this.smsDriver(smsDriverName);
-      const result = await driver.send({ tenantId, phone: dto.phone!, message: dto.message });
-      return { driver: driver.name, providerMessageId: result.providerMessageId };
-    }
-    if (channel === 'email') {
-      const result = await this.smtpDriver.send({
-        tenantId,
-        email: dto.email!,
-        subject: dto.subject,
-        message: dto.message,
-      });
-      return { driver: this.smtpDriver.name, providerMessageId: result.providerMessageId };
-    }
-    return this.sendViaWhatsapp(tenantId, dto);
-  }
-
-  private smsDriver(name: SmsDriverName): SmsDriver {
-    return name === 'skebby' ? this.skebbyDriver : this.personalGsmDriver;
-  }
-
-  private async sendViaWhatsapp(
-    tenantId: string,
-    dto: SendOtpDto,
-  ): Promise<Omit<SendOtpResult, 'channel' | 'usedFallback' | 'recipientMasked'>> {
-    const token = await this.getEvolutionToken(tenantId);
-    if (!token) {
-      throw new Error(`Nessun token Evolution per il tenant ${tenantId}`);
-    }
-
-    await this.applyOtpRateLimit(tenantId);
-
-    const evolutionUrl = this.configService.get<string>('EVOLUTION_API_URL');
-    const response = await firstValueFrom(
-      this.httpService.post(
-        `${evolutionUrl}/message/sendText/${tenantId}`,
-        { number: dto.phone!, text: dto.message },
-        { headers: { apikey: token }, timeout: 15000 },
-      ),
-    );
-    const providerMessageId = response.data?.key?.id;
-    if (providerMessageId) {
-      // Segna il messaggio come OTP: il consumer dei webhook registrerà
-      // l'esito di consegna solo per questi, senza sporcare gli altri.
-      await this.redis
-        .set(`${OTP_TRACK_PREFIX}${tenantId}:${providerMessageId}`, '1', 'EX', OTP_TRACK_TTL_S)
-        .catch(() => undefined);
-    }
-    return { driver: 'evolution', providerMessageId };
-  }
-
   /**
    * Esito di consegna di un OTP WhatsApp, se il webhook l'ha registrato.
    * Non blocca nessuno: l'operatore lo consulta quando vuole sapere se il
@@ -326,43 +188,32 @@ export class OtpDeliveryService {
     }
   }
 
-  /** Stessa cache token del WhatsappProcessor (chiave condivisa). */
-  private async getEvolutionToken(tenantId: string): Promise<string | null> {
-    const cacheKey = `evolution:token:${tenantId}`;
-    const cached = await this.redis.get(cacheKey);
-    if (cached) return cached;
+  /**
+   * Piano di canali per questa consegna.
+   *
+   * Arriva tutto dal chiamante: il registry lo manda a ogni richiesta,
+   * leggendolo da `signature_tenant_configs` — che e' la manopola vera, quella
+   * che il tenant vede e modifica dalla propria configurazione firme.
+   *
+   * Qui NON si legge piu' nessuna configurazione da OpenBao. C'era
+   * (`sms/<tenant>/otp_config`), ma essendo scavalcata a ogni chiamata non ha
+   * mai avuto effetto: una manopola che gira a vuoto costa piu' di quanto
+   * valga. I default sotto servono solo a un chiamante che non specifichi
+   * nulla, e non sono configurabili apposta: la configurazione ha gia' il suo
+   * posto, ed e' il database del registry.
+   */
+  private resolvePlan(dto: SendOtpDto): {
+    channels: OtpChannel[];
+    smsDriverName: SmsDriverName;
+  } {
+    const channels: OtpChannel[] = dto.channelPriority?.length
+      ? dto.channelPriority
+      : ['whatsapp', 'sms'];
 
-    const secret = await this.baoService.getSecret(`whatsapp/${tenantId}/evolution_apikey`);
-    if (secret?.api_key) {
-      await this.redis.set(cacheKey, secret.api_key, 'EX', 3600);
-      return secret.api_key;
-    }
-    return null;
+    // dedup preservando l'ordine
+    return {
+      channels: [...new Set(channels)],
+      smsDriverName: dto.smsDriver ?? 'personal_gsm',
+    };
   }
-
-  private async applyOtpRateLimit(tenantId: string): Promise<void> {
-    const key = `ratelimit:otp:evolution:${tenantId}`;
-    const last = await this.redis.get(key);
-    if (last) {
-      const elapsed = Date.now() - parseInt(last, 10);
-      if (elapsed < OTP_WA_MIN_INTERVAL_MS) {
-        await new Promise((resolve) => setTimeout(resolve, OTP_WA_MIN_INTERVAL_MS - elapsed));
-      }
-    }
-    await this.redis.set(key, Date.now().toString(), 'EX', 60);
-  }
-}
-
-/** mario.rossi@example.com → m**********i@example.com (mai l'indirizzo intero). */
-export function maskEmail(email: string): string {
-  const [local, domain] = email.split('@');
-  if (!domain) return '***';
-  const visible = local.length <= 2 ? local.slice(0, 1) : `${local[0]}${'*'.repeat(local.length - 2)}${local.slice(-1)}`;
-  return `${visible}@${domain}`;
-}
-
-/** +393471234567 → +39*******567 (nei log/audit non va mai il numero completo). */
-export function maskPhone(phone: string): string {
-  if (phone.length <= 6) return '***';
-  return `${phone.slice(0, 3)}${'*'.repeat(phone.length - 6)}${phone.slice(-3)}`;
 }

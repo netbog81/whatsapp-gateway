@@ -13,6 +13,7 @@ import {
 } from 'class-validator';
 import { Type } from 'class-transformer';
 import { ApiProperty } from '@nestjs/swagger';
+import { DeliveryPlanDto } from './delivery-plan.dto';
 
 export enum DispatchType {
   APPOINTMENT_BOOKING = 'APPOINTMENT_BOOKING',
@@ -37,7 +38,7 @@ export enum ReminderEarlyPolicy {
 /** Formato degli orari di fascia accettati dal gateway: HH:mm 24h. */
 const HH_MM = /^([01]\d|2[0-3]):[0-5]\d$/;
 
-export class BookingDataDto {
+export class BookingDataDto extends DeliveryPlanDto {
   @ApiProperty({ example: '10255', description: 'ID appuntamento nel DB Main App' })
   @IsString()
   appointmentId: string;
@@ -199,6 +200,41 @@ export class BookingDataDto {
   @IsOptional()
   @IsBoolean()
   sendUpdateNotification?: boolean;
+
+  @ApiProperty({
+    example: 'Gentile Mario Rossi, i suoi appuntamenti sono stati spostati:\n{appointments}',
+    description:
+      'Template NON renderizzato per lo spostamento di PIÙ appuntamenti dello stesso numero dentro la ' +
+      'finestra di raggruppamento. Il gateway sostituisce {appointments} con l\'elenco delle updateLine ' +
+      'bufferizzate e {name} con il nome del paziente.',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  updateMultiTemplate?: string;
+
+  @ApiProperty({
+    example: '- 15/02/2026 10:30 → 22/02/2026 11:00',
+    description:
+      'Riga di questo spostamento nell\'elenco multiplo (già formattata dalla main-app). Con più ' +
+      'spostamenti insieme il solo orario nuovo non basta: il paziente deve riconoscere quale ' +
+      'appuntamento si è mosso.',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  updateLine?: string;
+
+  @ApiProperty({
+    example: '2026-02-15T10:30:00',
+    description:
+      'Data e ora da cui l\'appuntamento è stato spostato (ISO 8601 senza offset, ora locale Europe/Rome). ' +
+      'Usata solo per comporre la riga di ripiego quando la main-app non manda updateLine.',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  previousDate?: string;
 }
 
 export class DispatchDto {

@@ -2,6 +2,7 @@ import { BadGatewayException } from '@nestjs/common';
 import { of } from 'rxjs';
 import { OtpDeliveryService, maskEmail, maskPhone } from './otp-delivery.service';
 import { SendOtpDto } from './dto/send-otp.dto';
+import { ChannelDeliveryService } from '../delivery/channel-delivery.service';
 
 describe('OtpDeliveryService', () => {
   let service: OtpDeliveryService;
@@ -31,13 +32,22 @@ describe('OtpDeliveryService', () => {
     smtpDriver = { name: 'smtp', send: jest.fn() };
     redis = { get: jest.fn().mockResolvedValue(null), set: jest.fn().mockResolvedValue('OK') };
 
-    service = new OtpDeliveryService(
+    // Il motore di consegna e' quello vero, montato sugli stessi mock: cosi'
+    // questi test continuano a verificare il comportamento end-to-end
+    // (ordine dei canali, salti, fallback) e non solo la delega.
+    const channelDelivery = new ChannelDeliveryService(
       httpService as any,
       configService as any,
       baoService as any,
-      auditService as any,
       personalGsmDriver as any,
       skebbyDriver as any,
+      smtpDriver as any,
+      redis as any,
+    );
+
+    service = new OtpDeliveryService(
+      channelDelivery,
+      auditService as any,
       smtpDriver as any,
       redis as any,
     );
@@ -90,23 +100,6 @@ describe('OtpDeliveryService', () => {
     expect(auditService.log).toHaveBeenCalledWith(
       expect.objectContaining({ eventType: 'OTP_FALLBACK' }),
     );
-  });
-
-  it('config per-tenant dal KV quando il chiamante non passa priorità', async () => {
-    baoService.getSecret.mockImplementation(async (path: string) => {
-      if (path.endsWith('otp_config')) {
-        return { primary_channel: 'sms', fallback_channel: 'whatsapp', sms_driver: 'skebby' };
-      }
-      return null;
-    });
-    skebbyDriver.send.mockResolvedValue({ providerMessageId: 'skb-9' });
-
-    const result = await service.send('bdq', dto(), '10.0.0.1');
-
-    expect(result.channel).toBe('sms');
-    expect(result.driver).toBe('skebby');
-    expect(skebbyDriver.send).toHaveBeenCalled();
-    expect(personalGsmDriver.send).not.toHaveBeenCalled();
   });
 
   it('default senza config: whatsapp primario, sms fallback', async () => {

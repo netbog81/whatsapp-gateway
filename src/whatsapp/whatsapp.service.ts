@@ -12,6 +12,7 @@ import { AuditService } from '../audit/audit.service';
 import { EncryptionService } from '../common/encryption.service';
 import { BaoService } from '../auth/bao.service';
 import { ReminderEarlyPolicy } from '../dto/dispatch.dto';
+import { RecapKind, recapKeys, recapKindOfJob } from './recap-buffer';
 
 /** Margine sul TTL della lista di buffer oltre la finestra di recap (safety-net). */
 const RECAP_TTL_MARGIN_SECONDS = 300;
@@ -25,14 +26,6 @@ const REMINDER_MIN_SPACING_SECONDS = 10;
 
 /** Margine sul TTL del contatore di slot oltre la fine della fascia. */
 const REMINDER_SLOT_TTL_MARGIN_SECONDS = 3600;
-
-/**
- * Scarto con cui la notifica di cancellazione si mette in fila DOPO un recap
- * ancora in attesa per lo stesso numero. Basta che i due job diventino
- * eseguibili in ordine: alla distanza vera fra i due invii pensa poi il rate
- * limit del processor.
- */
-const CANCEL_AFTER_RECAP_MARGIN_MS = 2000;
 
 /**
  * Stati con cui WhatsApp marca un messaggio in arrivo già visto. `PLAYED` è
@@ -501,14 +494,18 @@ export class WhatsappService {
     const data = job.data ?? {};
     const scheduledFor = new Date(job.timestamp + (job.delay ?? 0)).toISOString();
 
-    if (job.name === 'process-recap') {
+    const kind = recapKindOfJob(job.name);
+    if (kind) {
       // Il testo non esiste ancora: viene composto allo scadere della finestra,
       // con gli appuntamenti accumulati fino a quel momento.
-      const bufferedCount = await this.redis.llen(`pending:${data.tenantId}:${data.phone}`);
+      const { listKey } = recapKeys(kind, data.tenantId, data.phone);
+      const bufferedCount = await this.redis.llen(listKey);
       return {
         jobId: job.id,
         jobName: job.name,
-        type: 'recap',
+        // I nomi che la segreteria legge nel pannello: `recap` è quello
+        // storico delle prenotazioni e non si tocca.
+        type: kind === 'booking' ? 'recap' : `${kind}_recap`,
         phone: data.phone,
         pazienteId: data.pazienteId,
         appointmentIds: [],
@@ -555,12 +552,11 @@ export class WhatsappService {
     const snapshot = await this.toScheduledMessage(job, 'delayed');
     await job.remove();
 
-    if (job.name === 'process-recap') {
+    const cancelledKind = recapKindOfJob(job.name);
+    if (cancelledKind) {
       // Il timer se ne va: senza buffer non resta nulla da inviare.
-      await this.redis.del(
-        `pending:${tenantId}:${job.data.phone}`,
-        `recap_start:${tenantId}:${job.data.phone}`,
-      );
+      const { listKey, startKey } = recapKeys(cancelledKind, tenantId, job.data.phone);
+      await this.redis.del(listKey, startKey);
     }
 
     await this.auditService.log({
@@ -673,18 +669,17 @@ export class WhatsappService {
     // è il destinatario reale del messaggio e resta stabile anche per i walk-in
     // senza anagrafica, che altrimenti avrebbero un id diverso per ogni
     // appuntamento e non verrebbero mai raggruppati in un recap multiplo.
-    const recapKey = `pending:${tenantId}:${phone}`;
-    const encryptedData = this.encryptionService.encrypt(JSON.stringify(payload.data));
-    await this.redis.rpush(recapKey, encryptedData);
-    await this.redis.expire(recapKey, delaySeconds + RECAP_TTL_MARGIN_SECONDS);
+    await this.pushToRecapBuffer('booking', tenantId, phone, payload.data, delaySeconds);
 
     await this.scheduleRecap({
+      kind: 'booking',
       tenantId,
       phone,
       pazienteId,
       correlationId,
       recapMessage,
       delayMs: delaySeconds * 1000,
+      delivery: this.deliveryFields(payload.data),
     });
 
     // 2. LOGICA REMINDER 24H
@@ -692,47 +687,41 @@ export class WhatsappService {
   }
 
   /**
-   * Ritardo con cui accodare la notifica di cancellazione perché non scavalchi
-   * un recap ancora in attesa per lo stesso numero.
+   * Accoda un appuntamento nel buffer del raggruppamento indicato.
    *
-   * Il recap è un job ritardato: parte alla fine della finestra. La
-   * cancellazione invece parte subito, e senza questo correttivo arriverebbe
-   * al paziente prima della conferma di appuntamenti che aveva preso PRIMA di
-   * disdire. Torna 0 quando non c'è nulla in attesa, o quando il recap sta già
-   * partendo: in quel caso ci pensa la coda, che è FIFO con un solo worker.
+   * I payload sono cifrati AES-256 prima di toccare Redis: contengono nome,
+   * telefono e orari di una persona, e la coda non è il posto dove tenerli in
+   * chiaro. Il TTL è un fondo corsa — in condizioni normali è il processor a
+   * svuotare la lista — che evita di lasciare dati appesi se un job si perde.
    */
-  private async delayBehindPendingRecap(tenantId: string, phone: string): Promise<number> {
-    if (!phone) return 0;
-
-    const timer = await this.whatsappQueue.getJob(`timer-recap:${tenantId}:${phone}`);
-    if (!timer) return 0;
-
-    const remaining = timer.timestamp + (timer.delay ?? 0) - Date.now();
-    return remaining > 0 ? remaining + CANCEL_AFTER_RECAP_MARGIN_MS : 0;
+  private async pushToRecapBuffer(
+    kind: RecapKind,
+    tenantId: string,
+    phone: string,
+    data: any,
+    delaySeconds: number,
+  ): Promise<void> {
+    const { listKey } = recapKeys(kind, tenantId, phone);
+    await this.redis.rpush(listKey, this.encryptionService.encrypt(JSON.stringify(data)));
+    await this.redis.expire(listKey, delaySeconds + RECAP_TTL_MARGIN_SECONDS);
   }
 
   /**
-   * Toglie un appuntamento dal buffer di recap non ancora partito.
-   *
-   * Torna true solo se l'appuntamento c'era davvero: significa che il recap
-   * non è mai uscito e quindi il paziente non sa nulla di quella prenotazione.
-   *
-   * Se il buffer resta vuoto sparisce anche il timer, altrimenti scatterebbe
-   * a vuoto; se invece restano altri appuntamenti dello stesso numero il recap
-   * parte regolarmente, con i soli appuntamenti ancora validi.
+   * Voci bufferizzate di un appuntamento, con accanto la stringa cifrata
+   * originale: è quella che serve a `LREM`, che lavora per valore esatto.
    */
-  private async dropFromRecapBuffer(
+  private async findBuffered(
+    kind: RecapKind,
     tenantId: string,
     phone: string,
     appointmentId: string,
-  ): Promise<boolean> {
-    if (!phone || !appointmentId) return false;
+  ): Promise<{ raw: string; parsed: any }[]> {
+    if (!phone || !appointmentId) return [];
 
-    const recapKey = `pending:${tenantId}:${phone}`;
-    const buffered = await this.redis.lrange(recapKey, 0, -1);
-    if (buffered.length === 0) return false;
+    const { listKey } = recapKeys(kind, tenantId, phone);
+    const buffered = await this.redis.lrange(listKey, 0, -1);
 
-    let removed = 0;
+    const found: { raw: string; parsed: any }[] = [];
     for (const raw of buffered) {
       let parsed: any;
       try {
@@ -744,23 +733,114 @@ export class WhatsappService {
           continue;
         }
       }
-
-      if (String(parsed?.appointmentId) !== String(appointmentId)) continue;
-      // LREM per valore esatto: la stringa cifrata è quella che sta nella
-      // lista, quindi identifica la voce senza ambiguità.
-      removed += await this.redis.lrem(recapKey, 1, raw);
+      if (String(parsed?.appointmentId) === String(appointmentId)) found.push({ raw, parsed });
     }
 
+    return found;
+  }
+
+  /**
+   * Toglie dalla lista le voci di un appuntamento, senza toccare timer né
+   * finestra. È il mattone di `dropFromRecapBuffer`, ma serve anche da solo:
+   * uno spostamento che ne corregge un altro sostituisce la voce e basta, e
+   * non deve far ripartire da capo il tetto della finestra.
+   */
+  private async removeBufferedEntries(
+    kind: RecapKind,
+    tenantId: string,
+    phone: string,
+    appointmentId: string,
+  ): Promise<number> {
+    const matches = await this.findBuffered(kind, tenantId, phone, appointmentId);
+    if (matches.length === 0) return 0;
+
+    const { listKey } = recapKeys(kind, tenantId, phone);
+
+    let removed = 0;
+    for (const { raw } of matches) {
+      // LREM per valore esatto: la stringa cifrata è quella che sta nella
+      // lista, quindi identifica la voce senza ambiguità.
+      removed += await this.redis.lrem(listKey, 1, raw);
+    }
+
+    return removed;
+  }
+
+  /**
+   * Toglie un appuntamento da un buffer non ancora partito.
+   *
+   * Torna true solo se l'appuntamento c'era davvero: significa che il messaggio
+   * non è mai uscito e quindi il paziente non sa nulla di quella notizia.
+   *
+   * Se il buffer resta vuoto sparisce anche il timer, altrimenti scatterebbe
+   * a vuoto; se invece restano altri appuntamenti dello stesso numero il
+   * messaggio parte regolarmente, con le sole voci ancora valide.
+   */
+  private async dropFromRecapBuffer(
+    kind: RecapKind,
+    tenantId: string,
+    phone: string,
+    appointmentId: string,
+  ): Promise<boolean> {
+    const removed = await this.removeBufferedEntries(kind, tenantId, phone, appointmentId);
     if (removed === 0) return false;
 
-    if ((await this.redis.llen(recapKey)) === 0) {
-      await this.redis.del(recapKey, `recap_start:${tenantId}:${phone}`);
-      const timer = await this.whatsappQueue.getJob(`timer-recap:${tenantId}:${phone}`);
+    const { listKey, startKey, jobId } = recapKeys(kind, tenantId, phone);
+
+    if ((await this.redis.llen(listKey)) === 0) {
+      await this.redis.del(listKey, startKey);
+      const timer = await this.whatsappQueue.getJob(jobId);
       if (timer) {
         // Può essere già in esecuzione: in quel caso il buffer è appena stato
         // svuotato dal processor e non c'è nulla da rimuovere.
         await timer.remove().catch(() => undefined);
       }
+    }
+
+    return true;
+  }
+
+  /**
+   * Corregge sul posto la conferma di un appuntamento spostato mentre era
+   * ancora in buffer.
+   *
+   * È il caso di chi prenota e si accorge subito di aver sbagliato orario: il
+   * paziente non ha ancora ricevuto niente, e mandargli "confermiamo le 10" e
+   * due secondi dopo "spostato alle 11" racconta una confusione che non lo
+   * riguarda. Si riscrive la voce con i dati nuovi e parte solo la conferma.
+   *
+   * Torna false se l'appuntamento non era in buffer (conferma già partita: lo
+   * spostamento va comunicato davvero) o se il timer non c'è più, cioè il
+   * recap si sta svuotando proprio ora.
+   *
+   * L'ordine RPUSH-poi-LREM non è casuale: se il processor svuota il buffer
+   * nel mezzo, il peggio che capita è una riga ripetuta nel recap, mentre
+   * l'ordine inverso perderebbe l'appuntamento per strada.
+   */
+  private async rewriteBufferedBooking(
+    tenantId: string,
+    phone: string,
+    appointmentId: string,
+    update: { date?: string; recapMessage?: string; recapLine?: string },
+  ): Promise<boolean> {
+    const { listKey, jobId } = recapKeys('booking', tenantId, phone);
+
+    // Timer sparito = buffer in svuotamento o già svuotato: la conferma sta
+    // partendo con il vecchio orario e correggerla non è più possibile.
+    if (!(await this.whatsappQueue.getJob(jobId))) return false;
+
+    const matches = await this.findBuffered('booking', tenantId, phone, appointmentId);
+    if (matches.length === 0) return false;
+
+    for (const { raw, parsed } of matches) {
+      const merged = {
+        ...parsed,
+        ...(update.date ? { date: update.date } : {}),
+        ...(update.recapMessage ? { recapMessage: update.recapMessage } : {}),
+        ...(update.recapLine ? { recapLine: update.recapLine } : {}),
+      };
+      await this.redis.rpush(listKey, this.encryptionService.encrypt(JSON.stringify(merged)));
+      await this.redis.lrem(listKey, 1, raw);
     }
 
     return true;
@@ -796,6 +876,7 @@ export class WhatsappService {
         // riconcilia i propri log per message_type e non deve vedere una
         // categoria nuova solo perché l'invio è partito da un pulsante.
         message_type: 'single_recap',
+        ...this.deliveryFields(data, 'default', 'single_recap'),
       },
       { removeOnComplete: true },
     );
@@ -835,28 +916,79 @@ export class WhatsappService {
    * 15 min)` il recap parte comunque, altrimenti una sequenza continua di
    * prenotazioni lo rimanderebbe per sempre.
    */
+  /**
+   * Campi di consegna multicanale presi dal payload della main-app.
+   *
+   * Viaggiano DENTRO il job: un promemoria messo in coda oggi per domani deve
+   * partire con le regole di oggi. Rileggerle al momento dell'invio farebbe
+   * cambiare canale a messaggi gia' accettati, senza che nessuno sappia
+   * perche'.
+   *
+   * Senza piano restituisce un oggetto vuoto e il job resta quello di sempre,
+   * solo WhatsApp: i tenant che non hanno configurato altri canali non devono
+   * accorgersi di niente.
+   */
+  private deliveryFields(
+    data: any,
+    kind: 'default' | 'reminder' = 'default',
+    /**
+     * Tipo di messaggio, quando e' gia' noto al momento di accodare. Serve a
+     * scegliere i testi giusti da `channelTexts`. Per i raggruppamenti resta
+     * indefinito: quale sara' il tipo lo decide il processore alla chiusura
+     * della finestra, e i testi viaggiano tutti nel job.
+     */
+    messageType?: string,
+  ): Record<string, any> {
+    // Il promemoria puo' avere canali propri: e' una categoria diversa dalla
+    // conferma e lo studio la configura a parte. Senza i suoi, usa quelli
+    // della conferma.
+    const channels = kind === 'reminder' ? (data?.reminderChannels ?? data?.channels) : data?.channels;
+    if (!Array.isArray(channels) || !channels.length) return {};
+
+    const texts = messageType ? data?.channelTexts?.[messageType] : undefined;
+
+    return {
+      channels,
+      ...(data.email ? { email: data.email } : {}),
+      ...(data.smsDriver ? { smsDriver: data.smsDriver } : {}),
+      ...(data.emailFromName ? { emailFromName: data.emailFromName } : {}),
+      // I testi del tipo noto vincono; altrimenti si portano dietro l'intera
+      // mappa e sceglie il processore.
+      ...(texts?.sms ? { smsText: texts.sms } : {}),
+      ...(texts?.emailSubject ? { emailSubject: texts.emailSubject } : {}),
+      ...(texts?.emailBody ? { emailBody: texts.emailBody } : {}),
+      ...(!messageType && data.channelTexts ? { channelTexts: data.channelTexts } : {}),
+    };
+  }
+
   private async scheduleRecap(params: {
+    kind: RecapKind;
     tenantId: string;
     phone: string;
     pazienteId: string;
     correlationId: string;
     recapMessage?: string;
     delayMs: number;
+    /** Piano di canali, se la main-app ne ha indicato uno. */
+    delivery?: Record<string, any>;
   }): Promise<void> {
-    const { tenantId, phone, pazienteId, correlationId, recapMessage, delayMs } = params;
-    const jobId = `timer-recap:${tenantId}:${phone}`;
-    const jobData = { tenantId, pazienteId, phone, correlationId, recapMessage };
+    const { kind, tenantId, phone, pazienteId, correlationId, recapMessage, delayMs } = params;
+    const { startKey, jobId, jobName } = recapKeys(kind, tenantId, phone);
+    const jobData = {
+      kind, tenantId, pazienteId, phone, correlationId, recapMessage,
+      ...(params.delivery ?? {}),
+    };
 
     const existing = await this.whatsappQueue.getJob(jobId);
     if (!existing) {
       // Primo appuntamento del gruppo: apre la finestra.
       await this.redis.set(
-        `recap_start:${tenantId}:${phone}`,
+        startKey,
         Date.now().toString(),
         'EX',
         Math.ceil((RECAP_MAX_WINDOW_MS + delayMs) / 1000),
       );
-      await this.whatsappQueue.add('process-recap', jobData, {
+      await this.whatsappQueue.add(jobName, jobData, {
         delay: delayMs,
         jobId,
         removeOnComplete: true,
@@ -865,21 +997,21 @@ export class WhatsappService {
     }
 
     const now = Date.now();
-    const startRaw = await this.redis.get(`recap_start:${tenantId}:${phone}`);
+    const startRaw = await this.redis.get(startKey);
     const windowStart = startRaw ? parseInt(startRaw, 10) : now;
     const maxWindowMs = Math.min(delayMs * 5, RECAP_MAX_WINDOW_MS);
     const remainingMs = maxWindowMs - (now - windowStart);
 
     if (remainingMs <= 0) {
       // Tetto raggiunto: il job già programmato parte senza ulteriori rinvii.
-      this.logger.debug(`Recap ${tenantId}/${phone}: tetto finestra raggiunto, nessun rinvio`);
+      this.logger.debug(`Recap ${kind} ${tenantId}/${phone}: tetto finestra raggiunto, nessun rinvio`);
       return;
     }
 
     const newDelay = Math.min(delayMs, remainingMs);
     try {
       await existing.remove();
-      await this.whatsappQueue.add('process-recap', jobData, {
+      await this.whatsappQueue.add(jobName, jobData, {
         delay: newDelay,
         jobId,
         removeOnComplete: true,
@@ -889,9 +1021,9 @@ export class WhatsappService {
       // rimovibile. Ne accodo uno con id distinto così l'appuntamento appena
       // bufferizzato viene comunque recapitato.
       this.logger.warn(
-        `Recap ${tenantId}/${phone} non riprogrammabile (${error?.message}): accodo un job separato`,
+        `Recap ${kind} ${tenantId}/${phone} non riprogrammabile (${error?.message}): accodo un job separato`,
       );
-      await this.whatsappQueue.add('process-recap', jobData, {
+      await this.whatsappQueue.add(jobName, jobData, {
         delay: newDelay,
         jobId: `${jobId}:${now}`,
         removeOnComplete: true,
@@ -944,6 +1076,14 @@ export class WhatsappService {
         originalAppointmentId: appointmentId,
         appointmentIds: [appointmentId],
         message_type: 'reminder',
+        ...this.deliveryFields(
+          data,
+          'reminder',
+          // Stesso criterio con cui si sceglie il testo WhatsApp poco sopra:
+          // due giorni prima "domani" sarebbe falso, e il tenant ha un
+          // template dedicato.
+          daysAhead >= 2 ? 'reminder_48h' : 'reminder_24h',
+        ),
       },
       {
         delay,
@@ -1194,9 +1334,12 @@ export class WhatsappService {
    * accorparla ad altre prenotazioni renderebbe il messaggio incomprensibile.
    */
   private async handleUpdate(payload: any, tenantId: string, correlationId: string, actor: { user_id: string; ip_address: string }) {
-    const { appointmentId, pazienteId, phone, name, date, updateMessage, sendUpdateNotification } = payload.data;
+    const { appointmentId, pazienteId, phone, updateMessage, sendUpdateNotification, recapDelaySeconds } = payload.data;
 
     // 1. Il reminder programmato punta al vecchio orario: va sempre rimosso.
+    //    Questo passo NON entra mai nel buffer: il messaggio al paziente può
+    //    aspettare la finestra di raggruppamento, un promemoria che punta a
+    //    un orario che non esiste più no.
     const jobId = `reminder:${tenantId}:${appointmentId}`;
     const oldJob = await this.whatsappQueue.getJob(jobId);
     if (oldJob) {
@@ -1212,29 +1355,63 @@ export class WhatsappService {
       });
     }
 
-    // 2. Notifica di modifica al paziente (default: sì, salvo esplicito false)
-    let notification: 'queued' | 'disabled' = 'disabled';
-    if (sendUpdateNotification !== false) {
-      let content = updateMessage;
-      if (!content) {
-        const dt = DateTime.fromISO(date, { zone: 'Europe/Rome' });
-        content = `Gentile ${name}, il suo appuntamento è stato spostato al ${dt.toFormat('dd/MM/yyyy')} alle ${dt.toFormat('HH:mm')}.`;
-      }
+    // 2. Spostato mentre la conferma è ancora in buffer: si corregge quella e
+    //    non parte nessun "spostato" per un orario che il paziente non ha mai
+    //    saputo. Vale soprattutto per l'errore di battitura corretto subito.
+    //
+    //    Questo avviene ANCHE a notifiche di spostamento spente: correggere la
+    //    conferma non è avvisare di uno spostamento, è mandare una conferma che
+    //    dice l'ora giusta invece di una che dice l'ora sbagliata.
+    const bookingRewritten = await this.rewriteBufferedBooking(
+      tenantId,
+      phone,
+      appointmentId,
+      payload.data,
+    );
 
-      await this.whatsappQueue.add(
-        'send-reminder',
-        {
-          tenantId,
-          phone,
-          content,
-          correlationId,
-          pazienteId,
-          originalAppointmentId: appointmentId,
-          appointmentIds: [appointmentId],
-          message_type: 'update_notification',
-        },
-        { removeOnComplete: true },
+    let notification: 'queued' | 'disabled' | 'merged_into_recap' = 'disabled';
+
+    if (bookingRewritten) {
+      notification = 'merged_into_recap';
+      await this.auditService.log({
+        tenantId,
+        correlationId,
+        eventType: 'RECAP_REWRITTEN',
+        actor,
+        resource: { entity: 'APPOINTMENT', id: appointmentId },
+        status: 'SUCCESS',
+        payload: { phone, reason: 'UPDATED_WITHIN_BUFFER' },
+      });
+      this.logger.log(
+        `[RECAP] Appuntamento ${appointmentId} spostato dentro la finestra: corretta la conferma, nessun messaggio di spostamento`,
       );
+    } else if (sendUpdateNotification !== false) {
+      const delaySeconds = this.resolveRecapDelaySeconds(recapDelaySeconds);
+
+      // Spostato due volte nella stessa finestra: conta solo la destinazione
+      // finale, altrimenti l'elenco mostrerebbe due righe per un solo
+      // appuntamento e una delle due sarebbe già vecchia.
+      await this.removeBufferedEntries('update', tenantId, phone, appointmentId);
+      // Il correlationId viaggia DENTRO la voce: se poi nella finestra resta
+      // questo solo appuntamento, il messaggio esce con l'id con cui la
+      // main-app ha già aperto il proprio log e la riconciliazione è esatta.
+      await this.pushToRecapBuffer(
+        'update',
+        tenantId,
+        phone,
+        { ...payload.data, correlationId },
+        delaySeconds,
+      );
+      await this.scheduleRecap({
+        kind: 'update',
+        tenantId,
+        phone,
+        pazienteId,
+        correlationId,
+        recapMessage: updateMessage,
+        delayMs: delaySeconds * 1000,
+        delivery: this.deliveryFields(payload.data),
+      });
       notification = 'queued';
     }
 
@@ -1255,11 +1432,15 @@ export class WhatsappService {
       status: 'queued',
       updateNotification: notification,
       reminder: rescheduled ? 'rescheduled' : 'not_scheduled',
+      bookingRewritten,
     };
   }
 
   private async handleCancellation(payload: any, tenantId: string, correlationId: string, actor: { user_id: string; ip_address: string }) {
-    const { appointmentId, phone, name, date, sendCancelNotification, cancelNotificationMessage, pazienteId } = payload.data;
+    // `name` e `date` restano nel payload bufferizzato: il testo di ripiego,
+    // quando la main-app non manda il proprio, lo compone il processor alla
+    // chiusura della finestra.
+    const { appointmentId, phone, sendCancelNotification, cancelNotificationMessage, pazienteId } = payload.data;
     const jobId = `reminder:${tenantId}:${appointmentId}`;
     const job = await this.whatsappQueue.getJob(jobId);
 
@@ -1278,11 +1459,15 @@ export class WhatsappService {
       });
     }
 
+    // Spostato e poi disdetto nella stessa finestra: lo spostamento non
+    // interessa più nessuno, conta solo che l'appuntamento non c'è più.
+    await this.dropFromRecapBuffer('update', tenantId, phone, appointmentId);
+
     // Appuntamento disdetto mentre il recap è ancora nel buffer: il paziente
     // non ha ricevuto nulla, quindi non c'è nulla da smentire. Si toglie
     // l'appuntamento dal buffer e si tace — invece di mandargli conferma e
     // cancellazione a distanza di secondi.
-    const recapSuppressed = await this.dropFromRecapBuffer(tenantId, phone, appointmentId);
+    const recapSuppressed = await this.dropFromRecapBuffer('booking', tenantId, phone, appointmentId);
     if (recapSuppressed) {
       await this.auditService.log({
         tenantId,
@@ -1307,35 +1492,31 @@ export class WhatsappService {
 
     // Notifica cancellazione opzionale (default: false)
     if (sendCancelNotification === true) {
-      let content = cancelNotificationMessage;
-      if (!content) {
-        if (date && name) {
-          const dt = DateTime.fromISO(date, { zone: 'Europe/Rome' });
-          content = `Gentile ${name}, il suo appuntamento del ${dt.toFormat('dd/MM/yyyy')} alle ${dt.toFormat('HH:mm')} è stato cancellato.`;
-        } else {
-          content = `Il suo appuntamento è stato cancellato.`;
-        }
-      }
+      // Le disdette passano dallo stesso raggruppamento delle prenotazioni:
+      // chi disdice tre sedute in una telefonata riceve un elenco, non tre
+      // messaggi. L'ordine rispetto agli altri due raggruppamenti lo tiene il
+      // processor allo scadere della finestra.
+      const delaySeconds = this.resolveRecapDelaySeconds(payload.data.recapDelaySeconds);
 
-      // Se per lo stesso numero c'è ancora un recap in attesa, la cancellazione
-      // gli va DOPO: quegli appuntamenti erano stati presi prima della disdetta
-      // e leggere "cancellato" prima di "confermiamo" è incomprensibile.
-      const delay = await this.delayBehindPendingRecap(tenantId, phone);
-
-      await this.whatsappQueue.add(
-        'send-reminder',
-        {
-          tenantId,
-          phone,
-          content,
-          correlationId,
-          pazienteId,
-          originalAppointmentId: appointmentId,
-          appointmentIds: [appointmentId],
-          message_type: 'cancel_notification',
-        },
-        { removeOnComplete: true, ...(delay > 0 ? { delay } : {}) },
+      // Come per gli spostamenti: con un solo appuntamento nella finestra il
+      // messaggio esce con il correlationId del log già aperto dalla main-app.
+      await this.pushToRecapBuffer(
+        'cancel',
+        tenantId,
+        phone,
+        { ...payload.data, correlationId },
+        delaySeconds,
       );
+      await this.scheduleRecap({
+        kind: 'cancel',
+        tenantId,
+        phone,
+        pazienteId,
+        correlationId,
+        recapMessage: cancelNotificationMessage,
+        delayMs: delaySeconds * 1000,
+        delivery: this.deliveryFields(payload.data),
+      });
 
       await this.auditService.log({
         tenantId,
@@ -1344,7 +1525,7 @@ export class WhatsappService {
         actor,
         resource: { entity: 'APPOINTMENT', id: appointmentId },
         status: 'SUCCESS',
-        payload: { phone, ...(delay > 0 ? { delayedBehindRecapMs: delay } : {}) },
+        payload: { phone, bufferedForSeconds: delaySeconds },
       });
 
       return { status: reminderStatus, cancelNotification: 'queued' };

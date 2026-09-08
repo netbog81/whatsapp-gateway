@@ -47,6 +47,12 @@ describe('WhatsappService', () => {
       set: jest.fn().mockResolvedValue('OK'),
       get: jest.fn().mockResolvedValue(null),
       incr: jest.fn().mockImplementation(async (key: string) => (counters[key] = (counters[key] ?? 0) + 1)),
+      // Buffer vuoti finché un test non dice il contrario: spostamenti e
+      // disdette li interrogano sempre, per sapere se il messaggio precedente
+      // è già partito.
+      lrange: jest.fn().mockResolvedValue([]),
+      lrem: jest.fn().mockResolvedValue(0),
+      llen: jest.fn().mockResolvedValue(0),
     };
 
     mockAuditService = {
@@ -325,10 +331,16 @@ describe('WhatsappService', () => {
       date: '2026-12-15T10:30:00',
     });
 
-    /** Simula un buffer che contiene gli appuntamenti indicati. */
+    /**
+     * Simula il buffer delle PRENOTAZIONI con gli appuntamenti indicati. Gli
+     * altri buffer restano vuoti: la disdetta li interroga tutti e mescolarli
+     * nasconderebbe proprio la distinzione che si vuole verificare.
+     */
     const bufferWith = (...appointmentIds: string[]) => {
       const rows = appointmentIds.map((id) => `encrypted:${JSON.stringify({ appointmentId: id })}`);
-      mockRedis.lrange = jest.fn().mockResolvedValue(rows);
+      mockRedis.lrange = jest.fn().mockImplementation(async (key: string) =>
+        key === 'pending:tenant-1:393471234567' ? rows : [],
+      );
       mockRedis.lrem = jest.fn().mockResolvedValue(1);
       mockRedis.llen = jest.fn().mockResolvedValue(appointmentIds.length - 1);
       return rows;
@@ -378,18 +390,20 @@ describe('WhatsappService', () => {
       expect(mockRedis.del).not.toHaveBeenCalled();
     });
 
-    it('se il recap è già partito manda la cancellazione come prima', async () => {
+    it('se il recap è già partito la disdetta entra nel proprio raggruppamento', async () => {
       // Buffer vuoto: il messaggio al paziente è già uscito, tacere adesso
       // lo lascerebbe convinto di avere un appuntamento che non esiste più.
-      mockRedis.lrange = jest.fn().mockResolvedValue([]);
-
       const result = await service.cancel(cancelPayload(), 'tenant-1', 'user-1', '127.0.0.1');
 
       expect(result).toEqual(expect.objectContaining({ cancelNotification: 'queued' }));
+      expect(mockRedis.rpush).toHaveBeenCalledWith(
+        'pending:cancel:tenant-1:393471234567',
+        expect.stringContaining('encrypted:'),
+      );
       expect(mockQueue.add).toHaveBeenCalledWith(
-        'send-reminder',
-        expect.objectContaining({ message_type: 'cancel_notification' }),
-        expect.any(Object),
+        'process-cancel-recap',
+        expect.objectContaining({ kind: 'cancel', phone: '393471234567' }),
+        expect.objectContaining({ jobId: 'timer-cancel-recap:tenant-1:393471234567' }),
       );
     });
 
@@ -400,49 +414,42 @@ describe('WhatsappService', () => {
       expect(result).toEqual(expect.objectContaining({ cancelNotification: 'queued' }));
     });
 
-    describe('ordine rispetto a un recap ancora in attesa', () => {
-      const withPendingRecap = (remainingMs: number) => {
-        mockRedis.lrange = jest.fn().mockResolvedValue([]); // recap di ALTRI appuntamenti
-        mockQueue.getJob = jest.fn().mockImplementation((id: string) =>
-          id.startsWith('timer-recap')
-            ? { timestamp: Date.now() - 1000, delay: 1000 + remainingMs }
-            : null,
-        );
-      };
+    it('raggruppa più disdette dello stesso numero in un solo timer', async () => {
+      const timer = { remove: jest.fn().mockResolvedValue(undefined) };
+      mockQueue.getJob = jest.fn().mockImplementation((id: string) =>
+        id === 'timer-cancel-recap:tenant-1:393471234567' ? timer : null,
+      );
 
-      const cancelJob = () =>
-        mockQueue.add.mock.calls.find(
-          (c: any[]) => c[1]?.message_type === 'cancel_notification',
-        );
+      await service.cancel(cancelPayload('123'), 'tenant-1', 'user-1', '127.0.0.1');
+      await service.cancel(cancelPayload('456'), 'tenant-1', 'user-1', '127.0.0.1');
 
-      it('mette la cancellazione dopo la fine della finestra', async () => {
-        withPendingRecap(60_000);
+      // Due appuntamenti nello stesso buffer, un solo messaggio in uscita.
+      const buffered = mockRedis.rpush.mock.calls.filter(
+        (c: any[]) => c[0] === 'pending:cancel:tenant-1:393471234567',
+      );
+      expect(buffered).toHaveLength(2);
+      const timers = mockQueue.add.mock.calls.filter((c: any[]) => c[0] === 'process-cancel-recap');
+      expect(timers).toHaveLength(2); // il secondo rimpiazza il primo (finestra scorrevole)
+      expect(timer.remove).toHaveBeenCalled();
+    });
 
-        await service.cancel(cancelPayload(), 'tenant-1', 'user-1', '127.0.0.1');
+    it('uno spostamento già in attesa viene ritirato se poi si disdice', async () => {
+      // Spostato e poi disdetto nella stessa finestra: al paziente interessa
+      // solo che l'appuntamento non c'è più.
+      mockRedis.lrange = jest.fn().mockImplementation(async (key: string) =>
+        key === 'pending:update:tenant-1:393471234567'
+          ? [`encrypted:${JSON.stringify({ appointmentId: '123' })}`]
+          : [],
+      );
+      mockRedis.lrem = jest.fn().mockResolvedValue(1);
 
-        // Il paziente aveva preso quegli appuntamenti PRIMA di disdire: la
-        // conferma deve arrivargli prima della cancellazione.
-        expect(cancelJob()[2].delay).toBeGreaterThan(60_000);
-      });
+      await service.cancel(cancelPayload('123'), 'tenant-1', 'user-1', '127.0.0.1');
 
-      it('non ritarda nulla se non c\'è un recap in attesa', async () => {
-        mockRedis.lrange = jest.fn().mockResolvedValue([]);
-        mockQueue.getJob = jest.fn().mockResolvedValue(null);
-
-        await service.cancel(cancelPayload(), 'tenant-1', 'user-1', '127.0.0.1');
-
-        expect(cancelJob()[2].delay).toBeUndefined();
-      });
-
-      it('non ritarda se il recap sta già partendo', async () => {
-        // Finestra già scaduta: alla sequenza pensa la coda, che ha un solo
-        // worker e rispetta l'ordine di accodamento.
-        withPendingRecap(-5_000);
-
-        await service.cancel(cancelPayload(), 'tenant-1', 'user-1', '127.0.0.1');
-
-        expect(cancelJob()[2].delay).toBeUndefined();
-      });
+      expect(mockRedis.lrem).toHaveBeenCalledWith(
+        'pending:update:tenant-1:393471234567',
+        1,
+        expect.any(String),
+      );
     });
   });
 
@@ -952,24 +959,30 @@ describe('WhatsappService', () => {
       },
     });
 
-    it('dovrebbe rimuovere il reminder sul vecchio orario, notificare e riprogrammare', async () => {
+    it('dovrebbe rimuovere il reminder sul vecchio orario, bufferizzare la notifica e riprogrammare', async () => {
       const oldJob = { remove: jest.fn().mockResolvedValue(undefined) };
-      mockQueue.getJob.mockResolvedValue(oldJob);
+      // Solo il promemoria esiste: nessun raggruppamento aperto per il numero.
+      mockQueue.getJob = jest.fn().mockImplementation(async (id: string) =>
+        id === 'reminder:tenant-1:456' ? oldJob : null,
+      );
 
       const result = await service.dispatch(updatePayload(), 'tenant-1', 'user-1', '127.0.0.1');
 
       expect(mockQueue.getJob).toHaveBeenCalledWith('reminder:tenant-1:456');
       expect(oldJob.remove).toHaveBeenCalled();
 
+      // Lo spostamento entra nel proprio buffer invece di partire subito.
+      expect(mockRedis.rpush).toHaveBeenCalledWith(
+        'pending:update:tenant-1:393471234567',
+        expect.stringContaining('encrypted:'),
+      );
       expect(mockQueue.add).toHaveBeenCalledWith(
-        'send-reminder',
-        expect.objectContaining({
-          content: 'Spostato a domani',
-          message_type: 'update_notification',
-        }),
-        expect.any(Object),
+        'process-update-recap',
+        expect.objectContaining({ kind: 'update', recapMessage: 'Spostato a domani' }),
+        expect.objectContaining({ jobId: 'timer-update-recap:tenant-1:393471234567' }),
       );
 
+      // Il promemoria invece NON passa dal buffer: puntava al vecchio orario.
       expect(mockQueue.add).toHaveBeenCalledWith(
         'send-reminder',
         expect.objectContaining({
@@ -983,6 +996,7 @@ describe('WhatsappService', () => {
         status: 'queued',
         updateNotification: 'queued',
         reminder: 'rescheduled',
+        bookingRewritten: false,
       });
     });
 
@@ -996,13 +1010,114 @@ describe('WhatsappService', () => {
         '127.0.0.1',
       );
 
-      const queuedTypes = mockQueue.add.mock.calls.map((c: any[]) => c[1]?.message_type);
-      expect(queuedTypes).not.toContain('update_notification');
-      expect(queuedTypes).toContain('reminder');
+      const queuedNames = mockQueue.add.mock.calls.map((c: any[]) => c[0]);
+      expect(queuedNames).not.toContain('process-update-recap');
+      expect(mockQueue.add).toHaveBeenCalledWith(
+        'send-reminder',
+        expect.objectContaining({ message_type: 'reminder' }),
+        expect.any(Object),
+      );
       expect(result).toEqual({
         status: 'queued',
         updateNotification: 'disabled',
         reminder: 'rescheduled',
+        bookingRewritten: false,
+      });
+    });
+
+    it('due spostamenti dello stesso appuntamento lasciano in elenco solo il più recente', async () => {
+      const bufferedRow = `encrypted:${JSON.stringify({ appointmentId: '456' })}`;
+      mockRedis.lrange = jest.fn().mockImplementation(async (key: string) =>
+        key === 'pending:update:tenant-1:393471234567' ? [bufferedRow] : [],
+      );
+      mockRedis.lrem = jest.fn().mockResolvedValue(1);
+      mockQueue.getJob = jest.fn().mockResolvedValue(null);
+
+      await service.dispatch(updatePayload(), 'tenant-1', 'user-1', '127.0.0.1');
+
+      // La voce precedente esce dalla lista: una sola riga per appuntamento,
+      // con la destinazione buona.
+      expect(mockRedis.lrem).toHaveBeenCalledWith(
+        'pending:update:tenant-1:393471234567',
+        1,
+        bufferedRow,
+      );
+      expect(mockRedis.rpush).toHaveBeenCalledWith(
+        'pending:update:tenant-1:393471234567',
+        expect.stringContaining('encrypted:'),
+      );
+    });
+
+    describe('spostamento dentro la finestra della conferma', () => {
+      const bookingRow = `encrypted:${JSON.stringify({ appointmentId: '456', date: 'vecchia', recapLine: '- vecchia' })}`;
+
+      const withBufferedBooking = () => {
+        mockRedis.lrange = jest.fn().mockImplementation(async (key: string) =>
+          key === 'pending:tenant-1:393471234567' ? [bookingRow] : [],
+        );
+        mockRedis.lrem = jest.fn().mockResolvedValue(1);
+        mockQueue.getJob = jest.fn().mockImplementation(async (id: string) =>
+          id === 'timer-recap:tenant-1:393471234567'
+            ? { timestamp: Date.now(), delay: 60_000, remove: jest.fn() }
+            : null,
+        );
+      };
+
+      it('corregge la conferma invece di mandare un messaggio di spostamento', async () => {
+        withBufferedBooking();
+
+        const result = await service.dispatch(
+          updatePayload({ recapLine: '- nuova', recapMessage: 'Confermiamo per la nuova data' }),
+          'tenant-1',
+          'user-1',
+          '127.0.0.1',
+        );
+
+        expect(result).toEqual(
+          expect.objectContaining({ updateNotification: 'merged_into_recap', bookingRewritten: true }),
+        );
+        // La voce vecchia esce, quella corretta entra: il paziente riceve una
+        // conferma sola, con l'orario giusto.
+        expect(mockRedis.lrem).toHaveBeenCalledWith('pending:tenant-1:393471234567', 1, bookingRow);
+        expect(mockRedis.rpush).toHaveBeenCalledWith(
+          'pending:tenant-1:393471234567',
+          expect.stringContaining('- nuova'),
+        );
+        // Nessun raggruppamento di spostamenti aperto.
+        const names = mockQueue.add.mock.calls.map((c: any[]) => c[0]);
+        expect(names).not.toContain('process-update-recap');
+      });
+
+      it('corregge la conferma anche a notifiche di spostamento spente', async () => {
+        // Spegnere le notifiche vuol dire "non avvisarmi dei movimenti", non
+        // "mandami una conferma con l'ora sbagliata".
+        withBufferedBooking();
+
+        const result = await service.dispatch(
+          updatePayload({ sendUpdateNotification: false, recapLine: '- nuova' }),
+          'tenant-1',
+          'user-1',
+          '127.0.0.1',
+        );
+
+        expect(result).toEqual(expect.objectContaining({ bookingRewritten: true }));
+        expect(mockRedis.rpush).toHaveBeenCalledWith(
+          'pending:tenant-1:393471234567',
+          expect.stringContaining('- nuova'),
+        );
+      });
+
+      it('se la conferma è già partita lo spostamento si comunica davvero', async () => {
+        // Timer sparito = buffer svuotato: il paziente ha già letto il vecchio
+        // orario e va avvisato dello spostamento.
+        mockRedis.lrange = jest.fn().mockResolvedValue([]);
+        mockQueue.getJob = jest.fn().mockResolvedValue(null);
+
+        const result = await service.dispatch(updatePayload(), 'tenant-1', 'user-1', '127.0.0.1');
+
+        expect(result).toEqual(
+          expect.objectContaining({ updateNotification: 'queued', bookingRewritten: false }),
+        );
       });
     });
   });

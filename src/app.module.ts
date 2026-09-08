@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { NotifyModule } from './notify/notify.module';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { BullModule } from '@nestjs/bullmq';
 import { RedisModule } from '@nestjs-modules/ioredis';
@@ -66,6 +67,7 @@ import { OtpModule } from './otp/otp.module';
     HealthModule,
     SmsModule,
     OtpModule,
+    NotifyModule,
   ],
 })
 export class AppModule {}

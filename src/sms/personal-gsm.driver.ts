@@ -8,13 +8,25 @@ import { SmsDriver, SmsSendInput, SmsSendResult } from './sms-driver.interface';
 
 /**
  * Driver per il gateway SMS GSM fisico di rete (device personale con API
- * HTTP). Config per-tenant in OpenBao KV `sms/<tenantId>/gsm_gateway`:
+ * HTTP).
+ *
+ * La configurazione si cerca in due posti, nell'ordine:
+ *
+ *   1. `sms/<tenantId>/gsm_gateway`   — il tenant ha un device proprio
+ *   2. `sms/saas-relay/gsm_gateway`   — device condiviso di tutta la SaaS
+ *
+ * Stessa forma del ripiego dell'email (`mail/saas-relay`): un tenant che non
+ * ha un proprio apparato manda comunque, senza che qualcuno debba ricordarsi
+ * di copiargli la configurazione. Chi ne ha uno resta indipendente.
+ *
+ * Chiavi del secret:
  *
  *   base_url     es. "http://192.168.1.50:8080"  (obbligatorio)
  *   api_key      token del device (opzionale)
  *   http_method  "POST" (default) | "GET"
  *   path         default "/send"
  *   auth_style   "bearer" (default, header Authorization) | "query" (param apikey)
+ *   sender       etichetta del mittente, se il firmware la supporta (opzionale)
  *
  * POST: JSON { to, message }. GET: query ?to=<phone>&text=<msg>.
  * Adattare i campi del secret al firmware del device.
@@ -33,7 +45,10 @@ export class PersonalGsmDriver implements SmsDriver {
   async send(input: SmsSendInput): Promise<SmsSendResult> {
     const config = await this.getConfig(input.tenantId);
     if (!config?.base_url) {
-      throw new Error(`Gateway GSM non configurato per il tenant ${input.tenantId}`);
+      throw new Error(
+        `Gateway GSM non configurato: né sms/${input.tenantId}/gsm_gateway ` +
+          'né il ripiego condiviso sms/saas-relay/gsm_gateway',
+      );
     }
 
     const method = (config.http_method ?? 'POST').toUpperCase();
@@ -65,20 +80,42 @@ export class PersonalGsmDriver implements SmsDriver {
             ),
           );
 
-    this.logger.log(`SMS inviato via GSM gateway per tenant ${input.tenantId} (HTTP ${response.status})`);
+    this.logger.log(
+      `SMS inviato via GSM gateway per tenant ${input.tenantId} ` +
+        `(apparato ${config.source === 'saas' ? 'condiviso' : 'del tenant'}, HTTP ${response.status})`,
+    );
     const id = response.data?.id ?? response.data?.message_id ?? response.data?.messageId;
     return { providerMessageId: id ? String(id) : undefined };
   }
 
+  /**
+   * Configurazione del device: prima quella del tenant, poi quella condivisa.
+   *
+   * Si tiene in cache anche l'esito "condiviso": senza, ogni SMS di un tenant
+   * privo di apparato proprio interrogherebbe OpenBao due volte.
+   */
   private async getConfig(tenantId: string): Promise<Record<string, any> | null> {
     const cacheKey = `sms:gsm:config:${tenantId}`;
     const cached = await this.redis.get(cacheKey);
     if (cached) return JSON.parse(cached);
 
-    const secret = await this.baoService.getSecret(`sms/${tenantId}/gsm_gateway`);
-    if (secret) {
-      await this.redis.set(cacheKey, JSON.stringify(secret), 'EX', 600);
+    const perTenant = await this.baoService
+      .getSecret(`sms/${tenantId}/gsm_gateway`)
+      .catch(() => null);
+
+    let resolved: Record<string, any> | null = null;
+    if (perTenant?.base_url) {
+      resolved = { ...perTenant, source: 'tenant' };
+    } else {
+      const shared = await this.baoService
+        .getSecret('sms/saas-relay/gsm_gateway')
+        .catch(() => null);
+      if (shared?.base_url) resolved = { ...shared, source: 'saas' };
     }
-    return secret;
+
+    if (resolved) {
+      await this.redis.set(cacheKey, JSON.stringify(resolved), 'EX', 600);
+    }
+    return resolved;
   }
 }

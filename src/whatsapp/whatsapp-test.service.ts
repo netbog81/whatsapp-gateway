@@ -10,6 +10,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { DateTime } from 'luxon';
 import { BaoService } from '../auth/bao.service';
 import { EncryptionService } from '../common/encryption.service';
+import { recapKeys } from './recap-buffer';
 
 const RECAP_TTL_SECONDS = 300;
 
@@ -90,8 +91,9 @@ export class WhatsappTestService {
     };
 
     // 1. Inserisce nel buffer Redis (cifrato, come in produzione).
-    // Chiave per numero di telefono: stessa di WhatsappService/WhatsappProcessor.
-    const recapKey = `pending:${tenantId}:${phone}`;
+    // Chiave per numero di telefono: la stessa che usano service e processor,
+    // presa dalla fonte unica invece di riscriverla a mano.
+    const { listKey: recapKey } = recapKeys('booking', tenantId, phone);
     const encryptedData = this.encryptionService.encrypt(JSON.stringify(appointmentData));
     await this.redis.rpush(recapKey, encryptedData);
     await this.redis.expire(recapKey, RECAP_TTL_SECONDS);
@@ -155,7 +157,7 @@ export class WhatsappTestService {
       { offsetDays: 3, hour: 11, minute: 0,  label: '3' },
     ];
 
-    const recapKey = `pending:${tenantId}:${phone}`;
+    const { listKey: recapKey } = recapKeys('booking', tenantId, phone);
     const scheduledReminders = [];
 
     for (const appt of appointments) {

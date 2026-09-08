@@ -9,7 +9,13 @@ import { SmsDriver, SmsSendInput, SmsSendResult } from './sms-driver.interface';
 
 /**
  * Driver Skebby (provider SMS commerciale italiano, API REST).
- * Config per-tenant in OpenBao KV `sms/<tenantId>/skebby`:
+ *
+ * La configurazione si cerca in due posti, nell'ordine:
+ *
+ *   1. `sms/<tenantId>/skebby`   — il tenant ha un contratto proprio
+ *   2. `sms/saas-relay/skebby`   — account condiviso di tutta la SaaS
+ *
+ * Chiavi del secret:
  *
  *   username, password   credenziali account (obbligatori)
  *   sender               mittente alfanumerico registrato (opzionale)
@@ -31,9 +37,12 @@ export class SkebbyDriver implements SmsDriver {
   ) {}
 
   async send(input: SmsSendInput): Promise<SmsSendResult> {
-    const secret = await this.baoService.getSecret(`sms/${input.tenantId}/skebby`);
-    if (!secret?.username || !secret?.password) {
-      throw new Error(`Skebby non configurato per il tenant ${input.tenantId}`);
+    const secret = await this.resolveConfig(input.tenantId);
+    if (!secret) {
+      throw new Error(
+        `Skebby non configurato: né sms/${input.tenantId}/skebby ` +
+          'né il ripiego condiviso sms/saas-relay/skebby',
+      );
     }
 
     try {
@@ -53,7 +62,12 @@ export class SkebbyDriver implements SmsDriver {
     forceLogin: boolean,
   ): Promise<SmsSendResult> {
     const baseUrl = this.configService.get<string>('SKEBBY_API_URL', 'https://api.skebby.it/API/v1.0/REST');
-    const [userKey, sessionKey] = await this.getSession(input.tenantId, secret, baseUrl, forceLogin);
+    const [userKey, sessionKey] = await this.getSession(
+      secret.source === 'saas' ? 'saas-relay' : input.tenantId,
+      secret,
+      baseUrl,
+      forceLogin,
+    );
 
     const body: Record<string, unknown> = {
       message_type: secret.message_type ?? 'GP',
@@ -77,13 +91,34 @@ export class SkebbyDriver implements SmsDriver {
     return { providerMessageId: response.data?.order_id };
   }
 
+  /**
+   * Configurazione Skebby: prima quella del tenant, poi quella condivisa.
+   * Il campo `source` serve a decidere sotto quale chiave tenere la sessione.
+   */
+  private async resolveConfig(tenantId: string): Promise<Record<string, any> | null> {
+    const perTenant = await this.baoService.getSecret(`sms/${tenantId}/skebby`).catch(() => null);
+    if (perTenant?.username && perTenant?.password) {
+      return { ...perTenant, source: 'tenant' };
+    }
+
+    const shared = await this.baoService.getSecret('sms/saas-relay/skebby').catch(() => null);
+    if (shared?.username && shared?.password) {
+      return { ...shared, source: 'saas' };
+    }
+
+    return null;
+  }
+
   private async getSession(
-    tenantId: string,
+    sessionScope: string,
     secret: Record<string, any>,
     baseUrl: string,
     forceLogin: boolean,
   ): Promise<[string, string]> {
-    const cacheKey = `sms:skebby:session:${tenantId}`;
+    // Chiave per ACCOUNT e non per tenant: con l'account condiviso un login
+    // separato per ogni tenant sprecherebbe chiamate e farebbe scadere le
+    // sessioni a vicenda.
+    const cacheKey = `sms:skebby:session:${sessionScope}`;
     if (!forceLogin) {
       const cached = await this.redis.get(cacheKey);
       if (cached) return cached.split(';') as [string, string];

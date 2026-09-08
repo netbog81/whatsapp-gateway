@@ -33,7 +33,10 @@ export class SmtpDriver {
 
   async send(input: EmailSendInput): Promise<EmailSendResult> {
     const { config, transport } = await this.resolve(input.tenantId);
-    const from = config.fromName ? `"${config.fromName}" <${config.from}>` : config.from;
+    // Il nome del messaggio vince su quello della configurazione: la prima
+    // e' una scelta del tenant nelle impostazioni, la seconda un default.
+    const fromName = input.fromName || config.fromName;
+    const from = fromName ? `"${fromName}" <${config.from}>` : config.from;
 
     const info = await transport.sendMail({
       from,
